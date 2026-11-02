@@ -1,0 +1,23 @@
+# arXiv papers as Common Pile filtered them, one paper per document.
+#
+# Collected on 2026-07-17 as one folder of parquet shards with a `doc_id` and a `text` column and a `_DONE` marker.
+# The collector streamed `main` without recording a revision, so the one here is the head on that date - Common Pile has
+# not moved since 2025-06-06.
+#
+# A shard's `license` column is the collector's one label for the source and is wrong here: upstream holds
+# CC BY-SA and public-domain papers as well as CC BY. Each paper's own licence and url are in the
+# `manifest.parquet` beside the shards, joined back from this revision by `doc_id`.
+
+name: arxiv
+kind: source
+path: ${root:data/sources/arxiv}
+about: arXiv papers from Common Pile, one paper per document
+dataset: common-pile/arxiv_papers_filtered
+revision: 033cf7f53f9b348deec868c1a5a48484f3ee9e52
+licence: per-document
+
+# Collected as one row of the hub dataset a document, kept at 64k tokens and over
+collector: text
+min_tokens: 65536
+count_tokenizer: HuggingFaceTB/SmolLM3-3B-Base
+count_tokenizer_revision: d78a42f79198603e614095753484a04c10c2b940

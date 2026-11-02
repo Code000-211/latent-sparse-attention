@@ -1,0 +1,8 @@
+# Game-playing agent traces, released as traces-v1.
+
+name: games
+kind: source
+path: ${root:data/sources/games}
+about: game-playing agent traces
+collected_from: agent traces released as traces-v1
+licence: CC BY 4.0
