@@ -1,0 +1,45 @@
+name: Reproduction
+description: A number from the paper or the README does not come out the same
+labels: [reproduction]
+body:
+  - type: input
+    id: claim
+    attributes:
+      label: Result
+      description: Where the number is reported - the paper's table or figure, or the README section.
+      placeholder: Table 4, N-LSA 2,048 keys, RULER 4k
+    validations:
+      required: true
+  - type: input
+    id: expected
+    attributes:
+      label: Reported value
+    validations:
+      required: true
+  - type: input
+    id: observed
+    attributes:
+      label: Your value
+      description: With its error bar or sample count if you have one.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: Every command from setup to the number, with configs and overrides.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit or release, weights and data releases used, GPU and count, CUDA and driver versions, and the image tag if you serve.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything you changed or guessed along the way, and per-task scores if the number is a mean.

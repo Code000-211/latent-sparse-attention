@@ -1,0 +1,16 @@
+name: Feature
+description: Propose a new capability or a change in behaviour
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Need
+      description: What you are trying to do, and why the current code does not get you there.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you would change, and the alternatives you considered.

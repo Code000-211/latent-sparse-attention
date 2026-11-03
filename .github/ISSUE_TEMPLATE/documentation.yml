@@ -1,0 +1,23 @@
+name: Documentation
+description: The README or docs are wrong, missing a step, or unclear
+labels: [documentation]
+body:
+  - type: input
+    id: where
+    attributes:
+      label: Where
+      description: The file and section.
+      placeholder: README.md, Reproducing the paper / Native training
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What it says, and what you found when you followed it.
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix

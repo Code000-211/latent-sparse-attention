@@ -1,0 +1,37 @@
+name: Bug
+description: A command fails or does the wrong thing
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command, with the config and overrides you passed.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The error and the traceback or log lines around it.
+      render: text
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit or release, GPU, CUDA and driver versions, and Docker or enroot with the image tag if you serve.
+      placeholder: |
+        commit:
+        GPU:
+        CUDA / driver:
+        image:
+    validations:
+      required: true
