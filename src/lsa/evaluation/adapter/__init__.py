@@ -13,6 +13,7 @@ and is written once.
 | [rotary](rotary.py) | where the rotation sits, measured from the model rather than declared |
 | [qwen3_5](qwen3_5.py) | a packed output gate and a vision tower |
 | [glm5_next](glm5_next.py) | MLA projections and a NoPE index space |
+| [qwen4_exp](qwen4_exp.py) | QSA read through its selection, hyper-connection streams and an n-gram layer |
 
 ## Running a checkpoint that is already supported
 
@@ -67,6 +68,7 @@ from lsa.evaluation.adapter.glm5_next import Glm5NextAdapter, Glm5NextSparseAtte
 from lsa.evaluation.adapter.layer import Projection, SparseAttention, heads, rotary_function
 from lsa.evaluation.adapter.model import ModelAdapter, torch_dtype
 from lsa.evaluation.adapter.qwen3_5 import Qwen35Adapter, Qwen35SparseAttention
+from lsa.evaluation.adapter.qwen4_exp import Qwen4ExpAdapter, Qwen4ExpSparseAttention
 from lsa.evaluation.adapter.rotary import detect_rotary, resolve_rotary
 from lsa.evaluation.config import ModelConfig
 from lsa.evaluation.constants import Adapter
@@ -86,6 +88,8 @@ __all__ = [
     "Projection",
     "Qwen35Adapter",
     "Qwen35SparseAttention",
+    "Qwen4ExpAdapter",
+    "Qwen4ExpSparseAttention",
     "SparseAttention",
     "adapter_for",
     "detect_rotary",
@@ -224,4 +228,5 @@ def _check_not_broken(model_type: str) -> None:
 register(Adapter.GENERIC, ModelAdapter())
 register("qwen3_5", Qwen35Adapter())
 register("glm5_next", Glm5NextAdapter())
+register("qwen4_exp", Qwen4ExpAdapter())
 register_installed()

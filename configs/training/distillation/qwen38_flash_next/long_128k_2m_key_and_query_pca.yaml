@@ -1,0 +1,62 @@
+# D-LSA (Training-Free) on Qwen3.8-Flash-Next - the map left at the PCA it starts from, and its step-0 report.
+#
+# A run of no steps is the init and the export: each QSA layer's map is the top 64 principal directions of its key input
+# (the 384 position-free key dims, the summed query through the same transform), fitted on 8,192 rows spread over eight
+# training documents, and the temperature is calibrated on the same documents. The report scores that map on the
+# held-out sets before any step - the teacher's mass and top-k it holds at each length, which is the offline read of
+# whether the PCA map is near enough to QSA or a distillation should start from it. `model.space.init` set to this run's
+# maps starts one there.
+#
+# The recipe is Qwen3.8-27B's (`qwen38_27b/long_16k_1m_heavy_key_and_query_d2048.yaml`): the key and every head's query
+# summed, a 64-dim map, the dense target cut to the teacher's 2048 strongest keys. It reads the cache
+# `configs/data/targets/qwen38_flash_next/long_128k_2m_key_and_query.yaml` extracts, since the online teacher holds the
+# whole model on one node and four DGX Sparks are four nodes.
+#
+#     lsa --site spark distill train configs/training/distillation/qwen38_flash_next/long_128k_2m_key_and_query_pca.yaml
+#     lsa distill export $LSA_ROOT/training/distillation/qwen38_flash_next/long_128k_2m_key_and_query_pca \
+#         $LSA_ROOT/models/maps/qwen38_flash_next__long-128k-2M-key-and-query-pca-step0.pt
+
+defaults:
+  - base
+  - _self_
+
+model:
+  indexer:
+    window_size: 512
+    sink_size: 4
+    top_k: 2048
+    index_dim: 64
+    input: key_and_query
+    query_heads: all
+
+data:
+  root: ${root:data/targets/qwen38_flash_next/long_128k_2m_key_and_query}
+  # The twelve QSA layers
+  layers: [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47]
+  train:
+    - {name: natural, source: qwen38_flash_next, sources: &natural [arxiv, code, doab, games, gutenberg, hansard, swe, usgpo, wikimedia], split: train}
+    - {name: trajectories, source: qwen38_flash_next, sources: [edgebench], split: train}
+  evaluate:
+    - {name: 128k, source: qwen38_flash_next, sources: *natural, split: eval, lengths: [131072], limit: 4}
+    - {name: 512k, source: qwen38_flash_next, sources: *natural, split: eval, lengths: [524288], limit: 2}
+    - {name: 1m, source: qwen38_flash_next, sources: *natural, split: eval, lengths: [1048576], limit: 2}
+    - {name: 2m, source: qwen38_flash_next, sources: *natural, split: eval, lengths: [2097152], limit: 2}
+
+run:
+  name: long_128k_2m_key_and_query_pca
+
+  objective:
+    target: dense
+    target_depth: 2048
+
+  optim:
+    steps: 0
+    batch: 128
+    lr: 0.0003
+    tau_lr: 0.01
+    grad_clip: 1.0
+    seed: 0
+    draw: token
+
+  wandb:
+    enabled: false

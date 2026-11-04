@@ -107,9 +107,10 @@ What actually needs `read` is a model whose attention consumes something the cac
 
 Checkpoint-level differences go on `ModelAdapter` instead: `load` for a model class that is not `AutoModelForCausalLM` or a tower to drop, `text_model` for an unusual nesting, `full_attention_layers` for a layer stack that needs more than a name, `rotary_embedding` for tables that do not sit at `text_model.rotary_emb`.
 
-Two worked examples are in the tree.
+Three worked examples are in the tree.
 [qwen3_5.py](../../src/lsa/evaluation/adapter/qwen3_5.py) is the small one - a packed output gate and a vision tower, and nothing else.
 [glm5_next.py](../../src/lsa/evaluation/adapter/glm5_next.py) is the one that shows the shape of a harder model: MLA projections, a NoPE index space, a per-family default for which layer types to swap, and an attention module whose decoder layer unpacks three values instead of two.
+[qwen4_exp.py](../../src/lsa/evaluation/adapter/qwen4_exp.py), Qwen3.8-Flash-Next, reuses Qwen3.5's projections and shows what a model's own indexer costs: transformers' QSA selects in a Python loop over queries, so the adapter binds a blocked selection and a read by gather at load, and its span runs four hyper-connection streams and an n-gram layer that reads the token ids.
 
 ## Checking it
 

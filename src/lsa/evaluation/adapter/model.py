@@ -211,6 +211,7 @@ class ModelAdapter:
         hidden: torch.Tensor,
         positions: torch.Tensor,
         cache: Any,
+        ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run decoder layers `[start, stop)` over one chunk, the way the stack's own forward runs them.
 
@@ -220,6 +221,7 @@ class ModelAdapter:
             hidden: What layer `start` reads, for this chunk.
             positions: Absolute positions of the chunk [1, S] int64.
             cache: The transformers cache the chunks share, or None for a document in one pass.
+            ids: The chunk's token ids [1, S] int64, for a stack with a layer that reads them past the embedding.
 
         Raises:
             NotImplementedError: Always - this model's stack has not been taught to run a span at a time.

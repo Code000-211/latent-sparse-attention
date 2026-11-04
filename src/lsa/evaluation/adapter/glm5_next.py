@@ -504,6 +504,7 @@ class Glm5NextAdapter(ModelAdapter):
         hidden: torch.Tensor,
         positions: torch.Tensor,
         cache: Any,
+        ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run decoder layers `[start, stop)` over one chunk, as `Glm5NextTextModel.forward` runs them.
 
@@ -518,6 +519,7 @@ class Glm5NextAdapter(ModelAdapter):
             hidden: The residual streams layer `start` reads [1, S, hc_mult, model_dim].
             positions: Absolute positions of the chunk [1, S] int64.
             cache: The transformers cache the chunks share, or None for a document in one pass.
+            ids: Unused - no layer here reads the token ids past the embedding.
 
         Returns:
             The residual streams layer `stop` reads [1, S, hc_mult, model_dim].

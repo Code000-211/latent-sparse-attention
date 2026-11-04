@@ -1,0 +1,86 @@
+# Qwen3.8-Flash-Next's key and query from 128k to 2M, both sides - what its training-free PCA map is fitted on and
+# scored against (`configs/training/distillation/qwen38_flash_next/long_128k_2m_key_and_query_pca.yaml`).
+#
+# Qwen3.8-27B's heavy mix (`qwen38_27b/long_16k_1m_heavy.yaml`), cut to what a PCA map needs: the same domains over the
+# same `qwen38_27b` corpus - the tokenizer is the same - four buckets of 8M tokens from 128k to 2M, and one held-out
+# document a domain a bucket for the step-0 report. A source document shorter than 2M cannot fill the top bucket, and a
+# domain that runs short gives its share back to the others. The targets are taken under the design's read - past the
+# 4 sinks, at least 512 back, query positions from 516 - with the model under YaRN to 2M, which the card applies.
+#
+# A layer file keeps the key heads' position-free dims side by side at every position [T, 384] bf16 and each group's
+# summed queries at the sampled rows [Q, 384] fp32, in place of `x` (2560 dims): about 9 KiB a token over the twelve
+# QSA layers, some 0.4 TB for the train side's 32M tokens (arithmetic).
+#
+# Four stages, one a DGX Spark, so no node holds more than a quarter of the stack. Span 0 is the tightest: layer 1
+# carries the 51B-parameter n-gram table, about 102 GB in bf16, beside the embedding and layers 0-3 - some 114 GB of a
+# GB10's 128 GB, so it prefills the shortest chunk and keeps one worker. The other spans hold 14 to 16 layers, 73 to 83
+# GB. The spans hand their residual streams over a filesystem every node mounts (`root` in the site file), and each node
+# runs its own stage under `launcher: local`:
+#
+#     lsa --site spark distill targets configs/data/targets/qwen38_flash_next/long_128k_2m_key_and_query.yaml --stage 0
+#     lsa --site spark distill targets configs/data/targets/qwen38_flash_next/long_128k_2m_key_and_query.yaml --stage 1
+#     lsa --site spark distill targets configs/data/targets/qwen38_flash_next/long_128k_2m_key_and_query.yaml --stage 2
+#     lsa --site spark distill targets configs/data/targets/qwen38_flash_next/long_128k_2m_key_and_query.yaml --stage 3
+model:
+  name: qwen38_flash_next
+  dtype: bfloat16
+  indexer:
+    window_size: 512
+    sink_size: 4
+data:
+  tokenized:
+    name: qwen38_27b
+    splits:
+    - train
+    - eval
+  selection:
+    datasets:
+    - qwen38_27b
+    lengths:
+    - 131072
+    - 524288
+    - 1048576
+    - 2097152
+    tokens_per_bucket: 8388608
+    domains:
+      books:
+      - gutenberg
+      academic:
+      - doab
+      - arxiv
+      code:
+      - code
+      agentic:
+      - swe
+      - games
+      - edgebench
+      government:
+      - usgpo
+      parliament:
+      - hansard
+      discussion:
+      - wikimedia
+    min_length:
+      edgebench: 262144
+    from_start:
+    - edgebench
+    group_by:
+      edgebench: ':'
+    scoring_per_domain: 1
+  queries:
+    train: 128
+    density: 0.008934
+    tail: 32
+    top: 2048
+    seed: 1000
+run:
+  collection: qwen38_flash_next
+  name: long_128k_2m_key_and_query
+  output: ${root:data/targets/qwen38_flash_next/long_128k_2m_key_and_query}
+  input: key_and_query
+  # The twelve QSA layers
+  layers: [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47]
+  # Spans [0, 4), [4, 20), [20, 34) and [34, 48)
+  stages: [4, 20, 34]
+  # A 16k chunk keeps span 0's activations a few GB beside its 114 GB of weights; layer 3's cache at 2M is 4 GiB
+  prefill: 16384

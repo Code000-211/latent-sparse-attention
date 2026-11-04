@@ -1,0 +1,31 @@
+# Qwen3.8-Flash-Next, the preview of the Qwen4 architecture (`qwen4_exp`). 48 layers - 36 Gated DeltaNet and 12 global,
+# every fourth - each global layer GQA of 24 query heads on 2 key-value heads of 256 dims, 64 of them rotated, read
+# through QSA, Qwen's own indexer: keys mean-pooled into blocks of 4, the 512 best blocks and the open one a query.
+# An MoE of 512 experts, 10 a token, about 6B active of 125B, four hyper-connection streams, and a 51B-parameter hashed
+# n-gram table on layer 1. 262,144 tokens native.
+#
+# Served and distilled with YaRN to 2M, under the same rotation, as `qwen38_27b` is to 10M: `rope_parameters` replaces
+# the checkpoint's own block whole at load in every harness that reads this card. A factor of 9 on the native 262,144 is
+# 2,359,296 positions, the shortest whole factor past a 2M (2,097,152-token) prompt and its answer.
+#
+# The tokenizer is Qwen3.8-27B's byte for byte - `tokenizer.json`, `vocab.json`, `merges.txt` and the chat template are
+# the same hub blobs - so the `qwen38_27b` corpus is this model's corpus too.
+
+name: qwen38_flash_next
+about: Qwen3.8-Flash-Next - QSA every fourth layer, distilled and served with YaRN to 2M
+repo: Qwen/Qwen3.8-Flash-Next
+revision: de4b8e4d43b917e7706784d8bb445c9af86a3540
+family: qwen4_exp
+flavor: flash_next
+rotary_end: prefix
+rotary_dim: 64
+layer_types: [qwen_sparse_attention]
+rope_parameters:
+  mrope_interleaved: true
+  mrope_section: [11, 11, 10]
+  rope_type: yarn
+  rope_theta: 10000000
+  partial_rotary_factor: 0.25
+  factor: 9.0
+  original_max_position_embeddings: 262144
+attention: block_sparse

@@ -1,0 +1,8 @@
+# Not a run - what every Qwen3.8-Flash-Next distillation run shares: the model its teacher reads, and where its runs write.
+# A run here names it first in its `defaults`.
+
+model:
+  name: qwen38_flash_next
+
+run:
+  output: ${root:training/distillation/qwen38_flash_next}

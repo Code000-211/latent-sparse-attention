@@ -71,6 +71,32 @@ class Glm(const.Glm):
     INDEXER_CLASS: str = "Glm5NextTextIndexer"
 
 
+class Qwen4Exp:
+    """Qwen3.8-Flash-Next (`qwen4_exp`) as the harness reads it.
+
+    Its config says `full_attention` for the global layers and transformers renames them on load, so the name a stack
+    declares once built is this one.
+    """
+
+    LAYER_TYPES: tuple[str, ...] = ("qwen_sparse_attention",)
+
+    # The modules a load rebinds, matched by name
+    # => importing them would pull in the whole modelling file, and a second model in the process keeps its own forward
+    ATTENTION_CLASS: str = "Qwen4ExpTextAttention"
+    INDEXER_CLASS: str = "Qwen4ExpTextQSAIndexer"
+
+    # The attention implementation a loaded model is switched to - no mask is built, since the read goes through the
+    # selection and a [chunk, keys] mask is 128 GiB of bool at a 64k chunk of a 2M document
+    SELECTION_ATTENTION: str = "lsa_qsa_selection"
+
+    # fp32 cells of one block's indexer scores, rows by heads by blocks
+    # => 512 rows over a 2M document's 524,288 blocks at 4 heads, 4 GiB, and a block narrows as the blocks grow
+    INDEXER_SCORE_CELLS: int = 2**30
+    # Elements of one block's gathered keys, rows by selected keys by key heads by head dims
+    # => some 250 rows at QSA's 2,051 keys, 2 key heads of 256, 0.5 GiB of bf16 a block
+    GATHER_CELLS: int = 2**28
+
+
 class Family:
     """The two architectures a kernel measurement drives, named as their model cards name the family."""
 

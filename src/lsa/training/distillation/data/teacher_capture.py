@@ -126,7 +126,9 @@ def capture_span_inputs(
                 else:
                     hidden = source.read(start, stop).to(ids.device)
                 positions = torch.arange(start, stop, device=ids.device)[None]
-                hidden = model_adapter.forward_span(text_model, span, hidden, positions, cache)
+                hidden = model_adapter.forward_span(
+                    text_model, span, hidden, positions, cache, ids[:, start:stop]
+                )
                 if sink is not None:
                     sink.append(hidden)
             del cache
@@ -158,11 +160,18 @@ def _capture(
         Args:
             index: The layer.
             _module: The attention module, unused.
-            args: Its positional arguments, the hidden states first when they are not a keyword.
-            kwargs: Its keyword arguments, which carry the rotary tables when the model has them.
+            args: Its positional arguments, the hidden states first when they are not a keyword, and the rotary
+                tables second on a decoder layer that passes them positionally - Qwen3.8-Flash-Next's does.
+            kwargs: Its keyword arguments, which carry the rotary tables when the model passes them by name.
         """
         hidden = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
         tables = kwargs.get("position_embeddings")
+        if tables is None and len(args) > 1 and _is_tables(args[1]):
+            tables = args[1]
+        if tables is not None:
+            # A layer handed the tables of every cached position - QSA's indexer rotates its block keys with them -
+            # keeps only the chunk's, so the passes join into one table a position
+            tables = tuple(table[:, -hidden.shape[1] :] for table in tables)
         if to_host:
             hidden = hidden.to(Cache.HOST)
             tables = None if tables is None else tuple(table.to(Cache.HOST) for table in tables)
@@ -173,6 +182,17 @@ def _capture(
         for index in layers
     ]
     return chunks, hooks
+
+
+def _is_tables(value: Any) -> bool:
+    """Tell whether a positional argument is a `(cos, sin)` pair.
+
+    Args:
+        value: The argument.
+    """
+    return (
+        isinstance(value, tuple) and len(value) == 2 and all(isinstance(part, torch.Tensor) for part in value)
+    )
 
 
 def _joined(pieces: list[tuple[Any, Any]]) -> tuple[Any, Any]:
