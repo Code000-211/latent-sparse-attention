@@ -681,3 +681,103 @@ def test_a_length_the_suite_does_not_offer_is_refused_at_load():
 def test_a_subset_of_the_suite_is_accepted():
     data = experiment.AccuracyDataConfig(suite="ruler", tasks=["ruler_cwe_4096"], lengths=[4096])
     assert data.tasks == ["ruler_cwe_4096"]
+
+
+PAPER_RULER = ["data.suite=ruler", "data.tasks=[ruler]", "data.lengths=[4096,32768]"]
+
+
+def test_the_ruler_group_names_every_ruler_task_at_the_lengths_asked(tmp_path):
+    from lsa.evaluation.accuracy.data import suites
+
+    run = load(tmp_path, overrides=PAPER_RULER)[0]
+    selected = suites.select(run.data.suite, run.data.tasks, run.data.lengths)
+    assert len(selected) == 26
+    assert {plan.length for plan in selected} == {4096, 32768}
+    assert all(task.startswith("ruler_") for task in run.data.tasks)
+
+
+def test_the_ruler_group_replaces_the_tasks_a_config_pins():
+    path = Path("configs/evaluation/accuracy/qwen38_27b/lsa_flat_tp1.yaml")
+    run = experiment.load(path, PAPER_RULER, kind=Evaluation.ACCURACY)[0]
+    assert "gpqa_diamond" not in run.data.tasks
+    assert len(run.data.tasks) > 26
+
+
+def test_a_task_beside_the_ruler_group_is_kept_once(tmp_path):
+    run = load(tmp_path, overrides=["data.tasks=[ruler_cwe_4096,ruler]"])[0]
+    assert run.data.tasks.count("ruler_cwe_4096") == 1
+    assert run.data.tasks[0] == "ruler_cwe_4096"
+
+
+def test_a_dry_run_prints_the_experiment_it_resolved(tmp_path, monkeypatch, capsys):
+    from lsa import cli
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a dry run built an executor")
+
+    monkeypatch.setattr("lsa.slurm.executor", refuse)
+    path = write(tmp_path, MINIMAL)
+    named = ["model.name=Qwen/Qwen3.8-27b", "run.output=results"]
+    cli.main(["evaluate", "accuracy", str(path), *PAPER_RULER, *named, "--dry-run", "--cpus", "12"])
+    printed = capsys.readouterr().out
+    assert "smoke: attention lsa, suite ruler" in printed
+    assert "tasks (26): ruler_niah_single_1_4096" in printed
+    assert "and 0 more" not in printed
+    assert "lengths: [4096, 32768]" in printed
+    assert "server: srun --overlap" in printed
+    assert "--container-image=/images/sglang.img" in printed
+    assert "sglang serve --model-path" in printed
+    assert "resources: " in printed
+    assert "gpus_per_node 8" in printed
+    assert "cpus_per_task 12" in printed
+
+
+def test_a_dry_run_without_an_image_prints_the_experiment_and_says_so(tmp_path, monkeypatch, capsys):
+    from lsa import cli
+
+    monkeypatch.setattr(
+        "lsa.slurm.executor", lambda *args, **kwargs: pytest.fail("a dry run built an executor")
+    )
+    path = write(tmp_path, MINIMAL.replace("  image: /images/sglang.img\n", ""))
+    named = ["model.name=Qwen/Qwen3.8-27b", "run.output=results"]
+    cli.main(["evaluate", "accuracy", str(path), *PAPER_RULER, *named, "--dry-run"])
+    printed = capsys.readouterr().out
+    assert "tasks (26): ruler_niah_single_1_4096" in printed
+    assert f"server: (not resolved in site {site.current()} - run.image is not named" in printed
+    assert "resources: " in printed
+    with pytest.raises(SystemExit, match="run.image is not named"):
+        cli.main(["evaluate", "accuracy", str(path), *PAPER_RULER, *named, "--cpus", "12"])
+
+
+@pytest.mark.parametrize(
+    ("kind", "config", "summary"),
+    [
+        ("kernels", "configs/evaluation/kernels/glm53_flash/lsa_flat.yaml", ", kernels "),
+        (
+            "production",
+            "configs/evaluation/production/glm53_flash/lsa_flat_cp8.yaml",
+            ", production, lengths ",
+        ),
+    ],
+)
+def test_a_dry_run_of_a_kind_that_is_never_pooled_prints_it(kind, config, summary, monkeypatch, capsys):
+    from lsa import cli
+
+    monkeypatch.setattr(
+        "lsa.slurm.executor", lambda *args, **kwargs: pytest.fail("a dry run built an executor")
+    )
+    cli.main(["evaluate", kind, config, "--dry-run"])
+    printed = capsys.readouterr().out
+    assert summary in printed
+    assert "resources: " in printed
+
+
+def test_a_long_task_list_is_counted_after_its_first_forty(tmp_path):
+    from lsa.evaluation import run
+
+    experiment_ = load(tmp_path, overrides=["data.suite=ruler"])[0]
+    tasks_line = run.describe(experiment_, {"gpus_per_node": 1}).splitlines()[1]
+    assert tasks_line.startswith("  tasks (")
+    assert tasks_line.count("ruler_") == 40
+    assert ", and " in tasks_line
+    assert tasks_line.endswith(" more")

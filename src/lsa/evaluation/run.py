@@ -37,13 +37,14 @@ Writes are atomic, because a rerun may overwrite `meta.json` while something els
 import argparse
 import copy
 import os
+import shlex
 import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from lsa import env, io, slurm
+from lsa import env, io, site, slurm
 from lsa.evaluation import gpu, launches, require_extra
 from lsa.evaluation.accuracy import pool
 from lsa.evaluation.accuracy.records import build_run_id, records_dir
@@ -421,24 +422,55 @@ RUNNERS: dict[str, Callable[[Any, bool], Path]] = {
 }
 
 
-def describe(experiment: "Experiment") -> str:
-    """Return the one line a dry run prints for an evaluation.
+def describe(experiment: "Experiment", parameters: Mapping[str, Any] | None = None) -> str:
+    """Return what an evaluation will run - one line, and with its job's parameters what a dry run resolves.
 
     Args:
-        experiment: The evaluation.
+        experiment: The evaluation, as loaded.
+        parameters: What its job asks slurm for, the command line's flags already laid over, or None for the
+            summary line alone.
 
     Returns:
-        What it will run.
+        The summary line, followed for a dry run by one indented line each for the tasks and lengths of a scored
+        run, the server's command as the container runs it, and the job's resources.
     """
-    model = experiment.model
-    head = f"{experiment.name}: attention {model.attention}"
-    from lsa.evaluation.config import KernelsConfig, ProductionConfig
+    from lsa.evaluation.accuracy.data import suites
+    from lsa.evaluation.config import AccuracyConfig, KernelsConfig, ProductionConfig
+    from lsa.sglang.launch import container_command, launch_line, with_settings
 
+    head = f"{experiment.name}: attention {experiment.model.attention}"
     if isinstance(experiment, KernelsConfig):
-        return f"{head}, kernels {experiment.data.phase}, contexts {experiment.data.contexts}"
-    if isinstance(experiment, ProductionConfig):
-        return f"{head}, production, lengths {experiment.data.lengths}"
-    return f"{head}, suite {experiment.data.suite}"
+        lines = [f"{head}, kernels {experiment.data.phase}, contexts {experiment.data.contexts}"]
+    elif isinstance(experiment, ProductionConfig):
+        lines = [f"{head}, production, lengths {experiment.data.lengths}"]
+    else:
+        lines = [f"{head}, suite {experiment.data.suite}"]
+    if parameters is None:
+        return lines[0]
+    if isinstance(experiment, AccuracyConfig):
+        data = experiment.data
+        plans = suites.select(data.suite, data.tasks or None, data.lengths or None)
+        shown = ", ".join(plan.task for plan in plans[: Evaluation.DRY_RUN_TASKS])
+        hidden = len(plans) - Evaluation.DRY_RUN_TASKS
+        more = f", and {hidden} more" if hidden > 0 else ""
+        lines.append(f"  tasks ({len(plans)}): {shown}{more}")
+        lengths = sorted({plan.length for plan in plans if plan.length})
+        if lengths:
+            lines.append(f"  lengths: {lengths}")
+    if not isinstance(experiment, KernelsConfig):
+        server = experiment.server()
+        if experiment.model.settings is not None:
+            server = replace(server, serve_args=with_settings(server.serve_args, experiment.model.settings))
+        try:
+            argv = container_command(server, launch_line(server, experiment.model.checkpoint))
+        except site.NotNamed as unnamed:
+            # A dry run is how a fresh clone finds out what it would run, and its site names no image or root yet
+            # => say what is missing here, and leave the refusal to the submission
+            lines.append(f"  server: (not resolved in site {site.current()} - {unnamed})")
+        else:
+            lines.append(f"  server: {shlex.join(argv)}")
+    lines.append("  resources: " + ", ".join(f"{key} {value}" for key, value in parameters.items()))
+    return "\n".join(lines)
 
 
 def gpu_count(experiments: list["Experiment"]) -> int:
@@ -745,23 +777,25 @@ def main(kind: str) -> None:
     from lsa.evaluation.config import load
 
     experiments = load(args.config, args.overrides, kind)
-    pooled = (
-        [pooled_run(experiment, args) for experiment in experiments] if kind == Evaluation.ACCURACY else []
-    )
+    # Only an accuracy run is pooled, and every evaluation needs an entry
+    # => the dry run and the submission below walk both lists together
+    pooled = [kind == Evaluation.ACCURACY and pooled_run(experiment, args) for experiment in experiments]
     for experiment in experiments:
         require_model(experiment)
-        print(describe(experiment), flush=True)
+        if not args.dry_run:
+            print(describe(experiment), flush=True)
     if any(pooled) and args.force:
         raise SystemExit(
             "--force scores every sample again, which a pooled run never does - give the rerun a run id of its own"
         )
+    parameters = {**job_parameters(experiments, args.gpus), **slurm.overrides(args)}
     if args.dry_run:
-        for experiment, is_pooled in zip(experiments, pooled, strict=False):
+        for experiment, is_pooled in zip(experiments, pooled, strict=True):
+            print(describe(experiment, parameters), flush=True)
             if is_pooled:
                 print(f"{experiment.name}: would submit {args.workers} workers onto one run", flush=True)
         return
 
-    parameters = {**job_parameters(experiments, args.gpus), **slurm.overrides(args)}
     if not any(pooled):
         submit(experiments, parameters, args.folder, args.force)
         return
