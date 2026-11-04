@@ -134,6 +134,16 @@ class Job:
     HOURS: int = 4
 
 
+class Benchmark:
+    """What a benchmark run feeds the model by default."""
+
+    # Tokens one forward holds, a batch being as many rows as fit
+    BATCH_TOKENS: int = 16384
+
+    # What the job is called in slurm and in the dry run's `would submit` line
+    JOB_NAME: str = "lsa-native-benchmark"
+
+
 class Evaluation:
     """What a held-out pass reads and how it is scored by default."""
 
