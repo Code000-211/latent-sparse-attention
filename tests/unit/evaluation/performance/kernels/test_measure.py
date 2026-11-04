@@ -825,3 +825,32 @@ class FlashInfer:
 
 class Fa3:
     pass
+
+
+@pytest.mark.parametrize(
+    ("capability", "generation"), [((9, 0), "hopper"), ((10, 0), "blackwell"), ((10, 3), "blackwell")]
+)
+def test_the_generation_is_the_one_sglang_picks_backends_for(monkeypatch, capability, generation):
+    from lsa.core.kernels import dispatch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(dispatch, "capability", lambda device: capability)
+    assert layer.device_generation() == generation
+
+
+@pytest.mark.parametrize("capability", [(12, 1), (12, 0), (8, 0)])
+def test_a_card_neither_generation_covers_is_refused(monkeypatch, capability):
+    # A GB10 is sm_121 - `major >= 10` read it as a B300 and handed it trtllm, which needs tcgen05
+    from lsa.core.kernels import dispatch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(dispatch, "capability", lambda device: capability)
+    with pytest.raises(ValueError, match="no sglang backends"):
+        layer.device_generation()
+
+
+def test_no_cuda_reads_as_hopper(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert layer.device_generation() == "hopper"

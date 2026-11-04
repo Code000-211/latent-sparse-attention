@@ -41,6 +41,11 @@ B200 = (10, 0)
 B300 = (10, 3)
 # The GPUs that have `tcgen05` MMA and tensor memory, which a kernel under cutedsl/blackwell needs
 BLACKWELL = frozenset({B200, B300})
+# The capability major every datacenter Blackwell shares - B200 and B300 are 10.x. A GB10 (DGX Spark, 12.1) or an
+# RTX 50 (12.0) is sold as Blackwell too, but has no `tcgen05`, no tensor memory and about 100 KiB of shared memory
+# a block against 228 KiB, so a check that means those - a backend, a kernel, a launch swept on a B300 - asks
+# `datacenter_blackwell` rather than `major >= 10`
+DATACENTER_BLACKWELL_MAJOR = 10
 
 # The GPUs each step's CuTeDSL kernel has been checked on, equal to the Triton kernel
 CUTEDSL: dict[str, frozenset[tuple[int, int]]] = {
@@ -83,3 +88,12 @@ def runs_cutedsl(step: str, kernels: str, device: torch.device) -> bool:
     """
     gpus = CUTEDSL[step]
     return kernels == "cutedsl" and device.type == "cuda" and capability(device) in gpus
+
+
+def datacenter_blackwell(device: torch.device) -> bool:
+    """Tell whether a device is a datacenter Blackwell - a B200 or a B300, not a GB10 or an RTX 50.
+
+    Args:
+        device: Any device; a CPU one is not.
+    """
+    return device.type == "cuda" and capability(device)[0] == DATACENTER_BLACKWELL_MAJOR

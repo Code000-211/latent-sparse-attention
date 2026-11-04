@@ -13,6 +13,8 @@ from typing import Any
 TOKENS: dict[str, str] = {
     "NVIDIA H200": "h200",
     "NVIDIA B300 SXM6 AC": "b300",
+    # DGX Spark - one GB10 a node, sm_121, 128 GB of memory the CPU shares
+    "NVIDIA GB10": "gb10",
 }
 
 

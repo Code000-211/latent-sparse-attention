@@ -55,3 +55,22 @@ def test_a_step_with_two_kernels_takes_the_one_built_for_the_gpu(monkeypatch, ca
 
 def test_a_cpu_tensor_takes_the_hopper_module():
     assert bucket_scan.kernel_for(torch.device("cpu")).__name__.endswith("hopper.bucket_scan")
+
+
+@pytest.mark.parametrize(
+    ("capability", "datacenter"),
+    [((9, 0), False), ((10, 0), True), ((10, 3), True), ((12, 0), False), ((12, 1), False)],
+)
+def test_only_a_b200_or_b300_counts_as_datacenter_blackwell(monkeypatch, capability, datacenter):
+    # A GB10 (12.1) and an RTX 50 (12.0) are sold as Blackwell but have no tcgen05 - `major >= 10` would take them
+    monkeypatch.setattr(dispatch, "capability", lambda device: capability)
+    assert dispatch.datacenter_blackwell(CUDA) is datacenter
+
+
+def test_a_cpu_device_is_no_datacenter_blackwell():
+    assert not dispatch.datacenter_blackwell(torch.device("cpu"))
+
+
+def test_a_gb10_runs_every_step_on_triton(monkeypatch):
+    monkeypatch.setattr(dispatch, "capability", lambda device: (12, 1))
+    assert not any(dispatch.runs_cutedsl(step, "cutedsl", CUDA) for step in dispatch.CUTEDSL)

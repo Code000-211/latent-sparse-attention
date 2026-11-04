@@ -9,9 +9,10 @@ code at all: it declares `layer_types`, and the generic adapter reads it.
 
 A document prefilled a chunk at a time - a teacher reading a million tokens - reads its full-attention layers
 through a causal kernel aligned to the bottom right, because transformers' `sdpa` path builds a dense mask of the
-chunk's queries by every cached key, 64 GiB for a 64k chunk at 1M. On a card that kernel is FlashAttention-3 off the
-kernel hub, which reads the 4 key heads by their groups of query heads as they are rather than one expanded per group,
-at some 2.5 times the expanded read's rate.
+chunk's queries by every cached key, 64 GiB for a 64k chunk at 1M. On a Hopper card that kernel is FlashAttention-3 off
+the kernel hub, which reads the 4 key heads by their groups of query heads as they are rather than one expanded per
+group, at some 2.5 times the expanded read's rate. FlashAttention-3 is built for Hopper alone, so any other card - a
+GB10 among them - reads one key-value group at a time through torch's own kernel, the way a test does.
 """
 
 from functools import cache
@@ -19,6 +20,7 @@ from typing import Any
 
 import torch
 
+from lsa.core.kernels import dispatch
 from lsa.evaluation.adapter.layer import Projection, SparseAttention, heads
 from lsa.evaluation.adapter.model import ModelAdapter, torch_dtype
 from lsa.evaluation.config import ModelConfig
@@ -46,8 +48,8 @@ def lower_right_causal_attention(
     """Attend a chunk of queries to every key up to its own position, each key head read by its group of query heads.
 
     The chunk is the last `query_count` positions of the keys, so the causal rule is aligned to the bottom right and
-    no mask is built. On a card FlashAttention-3 reads the grouped heads natively. Off one - a test - torch's own
-    kernel reads one key-value group at a time, its key head expanded to the group.
+    no mask is built. On a Hopper card FlashAttention-3 reads the grouped heads natively. Anywhere else - another card,
+    or a test - torch's own kernel reads one key-value group at a time, its key head expanded to the group.
 
     Args:
         module: The attention module, unused.
@@ -68,7 +70,7 @@ def lower_right_causal_attention(
     """
     if attention_mask is not None:
         raise ValueError("a lower-right causal read takes no padding mask")
-    if query.is_cuda:
+    if query.is_cuda and dispatch.capability(query.device) == dispatch.HOPPER:
         # The kernel takes [B, T, H, dh], and its causal rule is already the bottom right's when Tq < Tk
         output = flash_kernel().flash_attn_func(
             query.transpose(1, 2),

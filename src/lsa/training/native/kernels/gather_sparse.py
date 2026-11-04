@@ -50,6 +50,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from lsa.core.kernels import dispatch
 from lsa.training.native.kernels.dsa_sparse.flash import _delta_kernel
 
 LOG2E = 1.4426950408889634
@@ -1019,8 +1020,11 @@ def _dkv_launch(device: torch.device, block_d: int) -> dict[str, int]:
 
 
 def _blackwell(device: torch.device) -> bool:
-    """Return whether the device is Blackwell or later."""
-    return torch.cuda.get_device_capability(device)[0] >= 10
+    """Return whether the device is a datacenter Blackwell, the GPU the Blackwell launches were swept on.
+
+    A GB10 or an RTX 50 has well under half a B300's shared memory a block, so those launches are not its.
+    """
+    return dispatch.datacenter_blackwell(device)
 
 
 def _sm_count(device: torch.device) -> int:

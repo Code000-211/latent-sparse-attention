@@ -13,6 +13,7 @@ from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder_sharding import dense_activation_placement, dense_param_placement
 from torchtitan.protocols.module import Module
 
+from lsa.core.kernels import dispatch
 from lsa.training.native.config import AttentionConfig
 from lsa.training.native.heads import HeadShapeAttention
 from lsa.training.native.kernels.nsa import autograd as kernels
@@ -219,7 +220,8 @@ def sliding_attention(
     Returns:
         Window context [B, T, H, head_dim].
     """
-    if queries.is_cuda and torch.cuda.get_device_capability(queries.device)[0] >= 10:
+    # FlashAttention-4 is written for `tcgen05`, which a GB10 or an RTX 50 does not have - they read through FA2
+    if dispatch.datacenter_blackwell(queries.device):
         from flash_attn.cute import flash_attn_func as flash_attn_4_func
 
         # Returns the output and the log-sum-exp

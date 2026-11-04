@@ -22,7 +22,7 @@ def smi(monkeypatch, stdout="", error=None):
     monkeypatch.setattr(gpu.subprocess, "run", run)
 
 
-@pytest.mark.parametrize(("device", "short"), [(H200, "h200"), (B300, "b300")])
+@pytest.mark.parametrize(("device", "short"), [(H200, "h200"), (B300, "b300"), ("NVIDIA GB10", "gb10")])
 def test_a_device_has_one_token(device, short):
     assert gpu.token(device) == short
     assert gpu.resolve(short) == gpu.resolve(device) == device

@@ -30,6 +30,7 @@ import torch
 
 import lsa
 from lsa import io
+from lsa.core.kernels import dispatch
 from lsa.evaluation.constants import Family
 from lsa.evaluation.performance.kernels.family import checkpoint_family
 from lsa.evaluation.performance.kernels.measure.selection import selection_rows
@@ -106,9 +107,26 @@ UPSTREAM_DSA = {"hopper": ("flashmla_sparse", "fa3"), "blackwell": ("flashmla_sp
 
 
 def device_generation():
-    """Return `blackwell` on sm_100 and up and `hopper` otherwise - the two generations sglang picks backends for."""
-    blackwell = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
-    return "blackwell" if blackwell else "hopper"
+    """Return `blackwell` on a B200 or B300 and `hopper` on an H100 or H200 - the two generations sglang picks backends for.
+
+    No CUDA reads as Hopper, which is what a test without a card builds its arguments for. Any other card is refused:
+    a GB10 or an RTX 50 runs neither generation's picks - trtllm and FlashInfer's MLA want `tcgen05`, fa3 and FlashMLA
+    want Hopper - and a measurement on the wrong backend is a number nobody asked for.
+
+    Raises:
+        ValueError: The card is neither generation.
+    """
+    if not torch.cuda.is_available():
+        return "hopper"
+    device = torch.device("cuda", torch.cuda.current_device())
+    if dispatch.datacenter_blackwell(device):
+        return "blackwell"
+    if dispatch.capability(device)[0] == dispatch.HOPPER[0]:
+        return "hopper"
+    raise ValueError(
+        f"no sglang backends are chosen for sm_{''.join(map(str, dispatch.capability(device)))} - "
+        "the kernel measurement runs on Hopper (sm_90) or a datacenter Blackwell (sm_100, sm_103)"
+    )
 
 
 def overrides(args):

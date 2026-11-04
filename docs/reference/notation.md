@@ -382,7 +382,7 @@ A run's name ends in its card's token, and its id is the name, `__`, and the sta
 | name | holds | where |
 |---|---|---|
 | `gpu` | the card model as the device reports it, `NVIDIA H200` or `NVIDIA B300 SXM6 AC` - and in a config the card a pooled run is submitted for, as this or its token, since its directory is named before any node is reached | `run.gpu`, in every record and every config |
-| gpu token | the card's short lowercase name, `h200` or `b300`, which is last in a run's name | `gpu.TOKENS` |
+| gpu token | the card's short lowercase name, `h200`, `b300` or `gb10`, which is last in a run's name | `gpu.TOKENS` |
 | mesh token | `tp<n>` for tensor parallel, `cp<n>` for context parallel, prefill and decode together, the paper's CP of PCP and DCP, `dcp<n>` for decode context parallel alone, with `pp<n>` after it for a pipeline of more than one stage - `tp8`, `cp8`, `dcp8`, `tp8pp2` | a production name |
 
 The launch reads the device and refuses a run submitted for another card.
