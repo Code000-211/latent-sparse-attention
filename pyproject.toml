@@ -98,6 +98,11 @@ blackwell = [
     "flash-attn-4==4.0.0b36",
 ]
 
+# `extra-build-dependencies` as a whole, which the causal-conv1d build below uses, is stable from uv 0.10.
+# uv 0.9 warns that it is experimental but still uses it.
+[tool.uv]
+required-version = ">=0.10"
+
 # The driver is the ceiling, not the index: driver 570 takes any CUDA 12.x runtime
 # and will not load a cu130 wheel. cu129 is the last 12.x build of torch 2.13.0 and the first with Blackwell's
 # sm_100 and sm_103 kernels, so one lock serves the H200 and the B300 nodes alike.
@@ -108,6 +113,11 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu129" }
+
+# causal-conv1d builds against torch, and its isolated build would otherwise pull the newest torch from PyPI
+# => build it against the locked cu129 torch, so the CUDA it checks nvcc against is the one the env runs
+[tool.uv.extra-build-dependencies]
+causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 
 [dependency-groups]
 dev = [
