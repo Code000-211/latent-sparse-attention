@@ -1,0 +1,25 @@
+# Four DGX Sparks (one GB10 each, aarch64, 128 GB of memory the CPU and GPU share) with one filesystem every node mounts
+# - what `tools/spark/` runs Qwen3.8-Flash-Next's training-free PCA map on, and `docs/guide/spark.md` walks through
+#
+# Each node runs its own jobs under submitit's local executor, so nothing spans nodes: the extraction's four stages are
+# four local jobs, one a node, that hand their residual streams over the shared root.
+#
+# `root` and `hf_home` must be the same path on every node. The scripts override both from `SHARED` (`LSA_ROOT` and
+# `HF_HOME`), so this file only needs editing to run `lsa --site spark` by hand without them.
+launcher: local
+
+root: /mnt/lsa/runs
+
+hf_home: /mnt/lsa/hf
+
+datasets: /mnt/lsa/datasets
+
+mounts: []
+
+# No run here serves a model, so no image is read
+images:
+  h200: ""
+  b300: ""
+  early: ""
+  papertrail5m: ""
+  papertrail10m: ""
