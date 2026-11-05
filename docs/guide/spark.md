@@ -3,6 +3,8 @@
 How to make D-LSA (Training-Free) for Qwen3.8-Flash-Next - the map, and its step-0 report against QSA - on four DGX
 Sparks. Each step is one script in [tools/spark](../../tools/spark), and every script reads the same `SHARED`.
 
+To hand the whole run to a coding agent, give it [tools/spark/AGENT_PROMPT.md](../../tools/spark/AGENT_PROMPT.md).
+
 ## What it needs
 
 - **Four DGX Sparks** (GB10, sm_121, aarch64, 128 GB each), with this branch checked out at the same path on each.
