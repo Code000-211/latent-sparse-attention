@@ -1,0 +1,1063 @@
+From 13e424a27c018679a1f2badcf4a47dbe2a2272fc Mon Sep 17 00:00:00 2001
+From: Hero <caleb@calebgj.io>
+Date: Thu, 5 Nov 2026 23:10:40 +0000
+Subject: [PATCH 3/7] lsa: the index ops at decode latency
+
+Each op was a single workgroup's latency: a load at a time. The index
+projection issues 32 of its map's loads ahead of its chain (63 -> 17 us a
+decode row, 5.8 -> 0.55 ms a 8192-row chunk); Ward's search runs four
+partners' dot products at once (809 -> 221 us a block); the select's pick
+runs at 1024 threads with its scans four loads ahead, a three-digit radix
+select (11/11/10 bits), members read 16 bytes at a time, and, given a
+scratch, the first digit counted by the scoring launch across the device
+(373 -> 135 us a decode row at 512k, 394 -> 100 us at 128k; R9700, top_k
+4096, top_p 1024). Every order the arithmetic fixes is kept: the emulator and
+the card still equal libref/ref_lsa.h to the bit, with and without the
+scratch.
+
+(cherry picked from commit 1c4a36c702fb5876c3622802fb91c83ab44f0c71)
+---
+ docs/OPS.md                |  10 +-
+ libr4d/r4d_lsa.hip         | 283 +++++++++++++++++++++++++++----------
+ libr4d/r4d_plugin.h        |   1 +
+ libr4d/r4d_rows.cpp        |   7 +-
+ tests/lsa_cases.h          | 162 +++++++++++++++++----
+ tests/lsa_device_test.cpp  |  85 ++++++++---
+ tests/lsa_ref_test.cpp     |  43 +-----
+ tests/r4d_emu/test_lsa.cpp |   9 +-
+ 8 files changed, 441 insertions(+), 159 deletions(-)
+
+diff --git a/docs/OPS.md b/docs/OPS.md
+index 365bece..62ebe78 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -3336,9 +3336,13 @@ the 64 dims), takes the `top_p` best (an equal score to the lower bucket), and r
+ best bucket first, keeping those at or past `sink` and before the window `[p + 1 - window, p]`, until
+ `top_k` are held; the last bucket is cut short. `sel` is the sinks `[0, min(sink, window start))`,
+ those keys and the window, ascending, -1 padded to its width (at least `sink + top_k + window`), and
+-`nsel` its length. Two launches: a thread a bucket scores into `score`, then a workgroup a row finds
+-the `top_p`-th best by a radix select, sorts the candidates best first by a key no two share, cuts the
+-walk by a prefix count and sorts the expansion.
++`nsel` its length. libr4d's `lsa_select_i32` is two launches: a thread a bucket scores into `score`,
++then a workgroup of 1024 a row finds the `top_p`-th best by a three-digit radix select over the
++scores' order keys (11, 11 and 10 bits), sorts the candidates best first by a key no two share, cuts
++the walk by a prefix count and sorts the expansion. Given its scratch (`[M][2048]` u32) the scoring
++launch also counts the first digit across the device, which the pick would otherwise count alone; the
++result is the same either way. On an R9700 one decode row takes ~100 us at 128k of context and
++~135 us at 512k, the flat design's budget.
+ 
+ ## Draft heads
+ 
+diff --git a/libr4d/r4d_lsa.hip b/libr4d/r4d_lsa.hip
+index cbc7b34..3899700 100644
+--- a/libr4d/r4d_lsa.hip
++++ b/libr4d/r4d_lsa.hip
+@@ -26,11 +26,15 @@
+ // [blocks, 1, window, (dim + cap) * 2 / bucket]: centroids [buckets][64] bf16, then members
+ // [buckets][cap] int16, block-local positions ascending, -1 past a bucket's size (ref_lsa.h Geom).
+ //
+-// The select is two launches. One thread scores one bucket against its row's query (the device's
+-// whole width on a decode row's 65536 buckets at 512k context), into the f32 `score` plane; then a
+-// workgroup a row finds the top_p-th best score by a four-digit radix select, sorts the candidates
++// The select is two launches (three with its scratch). One thread scores one bucket against its
++// row's query (the device's whole width on a decode row's 65536 buckets at 512k context), into the
++// f32 `score` plane, and with the scratch also counts the scores' first radix digit into the row's
++// histogram; then a workgroup of 1024 a row finds the top_p-th best score by a three-digit radix
++// select (11, 11, 10 bits of the order key; the first from those counts), sorts the candidates
+ // best first (an equal score to the lower bucket, by a composite key that makes the order unique),
+-// cuts the walk at top_k by a prefix count and sorts the expansion into position order.
++// cuts the walk at top_k by a prefix count and sorts the expansion into position order. The scratch
++// changes where the first digit is counted, never the result. Every one of these steps is the
++// workgroup's latency at decode, so the pick takes the widest workgroup and reads four loads ahead.
+ //
+ // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+ 
+@@ -47,6 +51,8 @@
+ namespace {
+ 
+ constexpr int kThreads    = 256;
++constexpr int kPick       = 1024;   /* the select's pick, a workgroup a row: its scans and sorts
++                                     * are its latency, so it takes the widest workgroup */
+ constexpr int kDim        = 64;     /* index dims: the published maps' width, and the only one here */
+ constexpr int kMaxKey     = 1024;   /* key-and-query input dims, n_head_kv * (head_dim - rot) */
+ constexpr int kMaxKv      = 16;
+@@ -54,7 +60,12 @@ constexpr int kMaxPools   = 128;    /* window / pool: two threads a pool in Ward
+ constexpr int kMaxBuckets = 64;     /* window / bucket */
+ constexpr int kMaxCap     = 32;
+ 
++/* The select's radix digits over a score's 32-bit order key: 11, 11 and 10 bits. */
++constexpr int kHist1      = 2048;
++
+ static_assert(kThreads == 2 * kMaxPools, "Ward's search gives each pool two threads");
++static_assert(kHist1 % kPick == 0 && 1024 % kPick == 0,
++              "the digit search gives each thread whole bins of every digit");
+ 
+ /* The one dot product (ref_lsa.h `dot`). */
+ __device__ __forceinline__ float lsa_dot(const float* a, const float* b) {
+@@ -63,30 +74,32 @@ __device__ __forceinline__ float lsa_dot(const float* a, const float* b) {
+     return acc;
+ }
+ 
+-/* Exclusive prefix sum of one int a thread over the workgroup, `*total` its sum. `sh` is
+- * kThreads ints of LDS; every thread must call it. */
++/* Exclusive prefix sum of one int a thread over a workgroup of NT, `*total` its sum. `sh` is NT
++ * ints of LDS; every thread must call it. */
++template <int NT>
+ __device__ int lsa_excl_scan(int v, int* sh, int* total) {
+     const int t = (int)threadIdx.x;
+     sh[t] = v;
+     __syncthreads();
+-    for (int off = 1; off < kThreads; off <<= 1) {
++    for (int off = 1; off < NT; off <<= 1) {
+         const int x = t >= off ? sh[t - off] : 0;
+         __syncthreads();
+         sh[t] += x;
+         __syncthreads();
+     }
+     const int incl = sh[t];
+-    *total = sh[kThreads - 1];
++    *total = sh[NT - 1];
+     __syncthreads();
+     return incl - v;
+ }
+ 
+-/* Ascending bitonic sort of `n` (a power of two) values in LDS; every thread must call it. */
+-template <class T>
++/* Ascending bitonic sort of `n` (a power of two) values in LDS by a workgroup of NT; every thread
++ * must call it. */
++template <int NT, class T>
+ __device__ void lsa_sort(T* s, int n) {
+     for (int k = 2; k <= n; k <<= 1)
+         for (int j = k >> 1; j > 0; j >>= 1) {
+-            for (int i = (int)threadIdx.x; i < n; i += kThreads) {
++            for (int i = (int)threadIdx.x; i < n; i += NT) {
+                 const int l = i ^ j;
+                 if (l > i) {
+                     const T a = s[i], b = s[l];
+@@ -127,6 +140,35 @@ __device__ __forceinline__ int lsa_seq_of(const int32_t* cu, int n_seq, int m) {
+     return -1;
+ }
+ 
++/* The digit a radix select takes: over `nbins` counts, the bin d (from the top) with fewer than
++ * `k` keys above it and at least `k` from it down. `out` gets d, k less the keys above it, and
++ * d's count. A chunk of bins a thread, then a walk by one thread over the chunks and the chunk's
++ * bins; every thread must call it. */
++template <int NT>
++__device__ void lsa_digit(const int* hist, int nbins, int k, int* sums, int* out) {
++    const int t = (int)threadIdx.x, per = nbins / NT;
++    int s = 0;
++    for (int i = 0; i < per; ++i) s += hist[t * per + i];
++    sums[t] = s;
++    __syncthreads();
++    if (t == 0) {
++        int above = 0, c = NT - 1;
++        for (; c > 0; --c) {
++            if (above + sums[c] >= k) break;
++            above += sums[c];
++        }
++        int d = c * per + per - 1;
++        for (; d > c * per; --d) {
++            if (above + hist[d] >= k) break;
++            above += hist[d];
++        }
++        out[0] = d;
++        out[1] = k - above;
++        out[2] = hist[d];
++    }
++    __syncthreads();
++}
++
+ // ============================================================== lsa_index_store
+ 
+ /* A workgroup a row. The query input sums each group's heads on the position-free dims in head
+@@ -157,11 +199,20 @@ __global__ __launch_bounds__(kThreads) void lsa_index_store_kernel(
+     for (int e = t; e < 2 * n_kv * kDim; e += kThreads) {
+         const int side = e / (n_kv * kDim), h = (e / kDim) % n_kv, j = e % kDim;
+         const uint16_t* w = map + (long)side * key_dim * kDim;
++        /* One chain, its loads issued ahead of it: the map is read from L2 at decode, and a
++         * load a step would leave the chain waiting on each. */
++        const float* xs = &x[side][h * free];
++        const uint16_t* wc = w + (long)h * free * kDim + j;
+         float acc = 0.0f;
+-        for (int i = 0; i < free; ++i) {
+-            const int row = h * free + i;
+-            acc = fmaf(x[side][row], bf16_to_f32(w[(long)row * kDim + j]), acc);
++        int i = 0;
++        for (; i + 32 <= free; i += 32) {
++            float wv[32];
++#pragma unroll
++            for (int u = 0; u < 32; ++u) wv[u] = bf16_to_f32(wc[(long)(i + u) * kDim]);
++#pragma unroll
++            for (int u = 0; u < 32; ++u) acc = fmaf(xs[i + u], wv[u], acc);
+         }
++        for (; i < free; ++i) acc = fmaf(xs[i], bf16_to_f32(wc[(long)i * kDim]), acc);
+         part[side][h][j] = acc;
+     }
+     __syncthreads();
+@@ -276,13 +327,30 @@ __global__ __launch_bounds__(kThreads) void lsa_cluster_kernel(
+             const int j1 = j0 + span < P ? j0 + span : P;
+             float bc = INFINITY;
+             int   bj = 0;
++            /* Four partners' dot products at once, each its own chain in the one order, so
++             * the costs are lsa_dot's; they are then compared in partner order. */
+             if (i < P && alive[i])
+-                for (int j = j0; j < j1; ++j) {
+-                    if (j == i || !alive[j] || sz[i] + sz[j] > (float)cap) continue;
+-                    const float g  = lsa_dot(&ks[i * kDim], &ks[j * kDim]);
+-                    const float m2 = (sq[i] + sq[j]) + 2.0f * g;
+-                    const float c  = (al[i] + al[j]) - sqrtf(m2 > 0.0f ? m2 : 0.0f);
+-                    if (c < bc) { bc = c; bj = j; }
++                for (int j = j0; j < j1; j += 4) {
++                    int jj[4];
++                    bool ok[4];
++                    for (int u = 0; u < 4; ++u) {
++                        const int x = j + u;
++                        ok[u] = x < j1 && x != i && alive[x] && sz[i] + sz[x] <= (float)cap;
++                        jj[u] = x < P ? x : P - 1;
++                    }
++                    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
++                    for (int d = 0; d < kDim; ++d) {
++                        const float xi = ks[i * kDim + d];
++#pragma unroll
++                        for (int u = 0; u < 4; ++u) acc[u] = fmaf(xi, ks[jj[u] * kDim + d], acc[u]);
++                    }
++                    for (int u = 0; u < 4; ++u) {
++                        if (!ok[u]) continue;
++                        const int x = jj[u];
++                        const float m2 = (sq[i] + sq[x]) + 2.0f * acc[u];
++                        const float c  = (al[i] + al[x]) - sqrtf(m2 > 0.0f ? m2 : 0.0f);
++                        if (c < bc) { bc = c; bj = x; }
++                    }
+                 }
+             hc[t] = bc;
+             hj[t] = bj;
+@@ -371,9 +439,11 @@ __global__ __launch_bounds__(kThreads) void lsa_score_kernel(
+     const float* __restrict__ iq, long iq_ld, const int32_t* __restrict__ pos,
+     const int32_t* __restrict__ cu, int n_seq, const uint8_t* __restrict__ bkt, long bkt_pages,
+     long page_bytes, const int32_t* __restrict__ bt, long bt_ld, long bt_cols,
+-    float* __restrict__ score, long sc_ld, int live, int window, int nb) {
++    float* __restrict__ score, long sc_ld, int live, int window, int nb,
++    uint32_t* __restrict__ hist) {
+     __shared__ float qv[kDim];
+     __shared__ int   info[2];
++    __shared__ uint32_t lh[kHist1];
+     const int m = (int)blockIdx.y, t = (int)threadIdx.x;
+     if (t == 0) {
+         const int s = lsa_seq_of(cu, n_seq, m);
+@@ -382,9 +452,10 @@ __global__ __launch_bounds__(kThreads) void lsa_score_kernel(
+     }
+     if (t < kDim) qv[t] = iq[(long)m * iq_ld + t];
+     __syncthreads();
++    if ((int)blockIdx.x * kThreads >= info[1]) return;
+     const int b = (int)blockIdx.x * kThreads + t;
+-    if (b >= info[1]) return;
+-    const int pg = bt[(long)info[0] * bt_ld + b / nb];
++    const bool live_b = b < info[1];
++    const int pg = live_b ? bt[(long)info[0] * bt_ld + b / nb] : -1;
+     float acc = -INFINITY;
+     if (pg >= 0 && pg < bkt_pages) {
+         const uint4* c4 = (const uint4*)(bkt + (long)pg * page_bytes + (long)(b % nb) * kDim * 2);
+@@ -398,22 +469,39 @@ __global__ __launch_bounds__(kThreads) void lsa_score_kernel(
+             }
+         }
+     }
+-    score[(long)m * sc_ld + b] = acc;
++    if (live_b) score[(long)m * sc_ld + b] = acc;
++    /* The row's first radix digit, counted here across the device rather than by the pick's one
++     * workgroup: the order keys' top 11 bits, a workgroup's counts added into the row's. */
++    if (hist) {
++        for (int i = t; i < kHist1; i += kThreads) lh[i] = 0;
++        __syncthreads();
++        if (live_b) atomicAdd(&lh[lsa_okey(acc) >> 21], 1u);
++        __syncthreads();
++        for (int i = t; i < kHist1; i += kThreads)
++            if (lh[i]) atomicAdd(&hist[(long)m * kHist1 + i], lh[i]);
++    }
++}
++
++__global__ __launch_bounds__(kThreads) void lsa_hist_zero_kernel(uint32_t* __restrict__ hist,
++                                                                  long n) {
++    const long i = (long)blockIdx.x * kThreads + threadIdx.x;
++    if (i < n) hist[i] = 0;
+ }
+ 
+ /* A workgroup a query row: the top_p candidates, best first, walked to top_k keys. */
+-__global__ __launch_bounds__(kThreads) void lsa_pick_kernel(
++__global__ __launch_bounds__(kPick) void lsa_pick_kernel(
+     const float* __restrict__ score, long sc_ld, int live, const int32_t* __restrict__ pos,
+     const int32_t* __restrict__ cu, int n_seq, const uint8_t* __restrict__ bkt, long bkt_pages,
+     long page_bytes, const int32_t* __restrict__ bt, long bt_ld, long bt_cols,
+     int32_t* __restrict__ sel, long sel_ld, int sel_w, int32_t* __restrict__ nsel,
+-    int window, int sink, int top_k, int top_p, int nb, int cap, int cand_n) {
++    int window, int sink, int top_k, int top_p, int nb, int cap, int cand_n,
++    const uint32_t* __restrict__ hist) {
+     R4D_DYN_LDS(uint64_t, dyn);
+     uint64_t* cand = dyn;                         /* [cand_n] candidates, then sorted */
+     int32_t*  cnt  = (int32_t*)(cand + cand_n);   /* [cand_n] keys each reads, then where they go */
+     int32_t*  exp  = cnt + cand_n;                /* [lsa_pow2(top_k)] the expansion */
+-    __shared__ int hist[256];
+-    __shared__ int scan[kThreads];
++    __shared__ int bins[kHist1];
++    __shared__ int scan[kPick];
+     __shared__ int info[6];
+     const int m = (int)blockIdx.x, t = (int)threadIdx.x;
+     if (t == 0) {
+@@ -427,42 +515,53 @@ __global__ __launch_bounds__(kThreads) void lsa_pick_kernel(
+     const int s = info[0], p = info[1], n = info[2];
+     int32_t* out = sel + (long)m * sel_ld;
+     if (s < 0 || p < 0) {
+-        for (int i = t; i < sel_w; i += kThreads) out[i] = -1;
++        for (int i = t; i < sel_w; i += kPick) out[i] = -1;
+         if (t == 0) nsel[m] = 0;
+         return;
+     }
+     const int ws = p + 1 - window > 0 ? p + 1 - window : 0;
+     const float* sc = score + (long)m * sc_ld;
+     const int32_t* row_bt = bt + (long)s * bt_ld;
++    /* Every visible bucket's order key, this thread's share, four loads ahead of their use: the
++     * plane is read from L2, and a loop of one load at a time is its latency end to end. */
++    auto each_key = [&](auto&& f) {
++        int b = t;
++        for (; b + 3 * kPick < n; b += 4 * kPick) {
++            const float v0 = sc[b], v1 = sc[b + kPick], v2 = sc[b + 2 * kPick], v3 = sc[b + 3 * kPick];
++            f(b, lsa_okey(v0));
++            f(b + kPick, lsa_okey(v1));
++            f(b + 2 * kPick, lsa_okey(v2));
++            f(b + 3 * kPick, lsa_okey(v3));
++        }
++        for (; b < n; b += kPick) f(b, lsa_okey(sc[b]));
++    };
+ 
+     /* ---- the candidates: every visible bucket, or the top_p best */
+     int C = n;
+     if (n <= top_p) {
+-        for (int b = t; b < n; b += kThreads) cand[b] = lsa_cand(lsa_okey(sc[b]), b);
++        for (int b = t; b < n; b += kPick) cand[b] = lsa_cand(lsa_okey(sc[b]), b);
+     } else {
++        /* Three digits of the order key, 11, 11 and 10 bits; the first from the score launch's
++         * counts where it kept them, else counted here like the others. */
+         uint32_t prefix = 0, mask = 0;
+         int k_rem = top_p;
+-        for (int shift = 24; shift >= 0; shift -= 8) {
+-            hist[t] = 0;
+-            __syncthreads();
+-            for (int b = t; b < n; b += kThreads) {
+-                const uint32_t key = lsa_okey(sc[b]);
+-                if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1);
+-            }
+-            __syncthreads();
+-            if (t == 0) {
+-                int above = 0, d = 255;
+-                for (; d > 0; --d) {
+-                    if (above + hist[d] >= k_rem) break;
+-                    above += hist[d];
+-                }
+-                info[3] = d;
+-                info[4] = k_rem - above;
+-                info[5] = hist[d];
++        const int shifts[3] = { 21, 10, 0 }, widths[3] = { 11, 11, 10 };
++        for (int pass = 0; pass < 3; ++pass) {
++            const int shift = shifts[pass], nbins = 1 << widths[pass];
++            if (pass == 0 && hist) {
++                for (int i = t; i < kHist1; i += kPick) bins[i] = (int)hist[(long)m * kHist1 + i];
++                __syncthreads();
++            } else {
++                for (int i = t; i < nbins; i += kPick) bins[i] = 0;
++                __syncthreads();
++                each_key([&](int, uint32_t key) {
++                    if ((key & mask) == prefix) atomicAdd(&bins[(key >> shift) & (uint32_t)(nbins - 1)], 1);
++                });
++                __syncthreads();
+             }
+-            __syncthreads();
++            lsa_digit<kPick>(bins, nbins, k_rem, scan, &info[3]);
+             prefix |= (uint32_t)info[3] << shift;
+-            mask |= 255u << shift;
++            mask |= (uint32_t)(nbins - 1) << shift;
+             k_rem = info[4];
+             __syncthreads();
+         }
+@@ -473,21 +572,20 @@ __global__ __launch_bounds__(kThreads) void lsa_pick_kernel(
+         const int need_eq = k_rem, all_eq = info[5] == k_rem;
+         if (t == 0) info[3] = 0;
+         __syncthreads();
+-        for (int b = t; b < n; b += kThreads) {
+-            const uint32_t key = lsa_okey(sc[b]);
++        each_key([&](int b, uint32_t key) {
+             if (key > thr || (all_eq && key == thr)) cand[atomicAdd(&info[3], 1)] = lsa_cand(key, b);
+-        }
++        });
+         __syncthreads();
+         if (!all_eq) {
+             int eq_base = 0, c_base = info[3];
+-            for (int b0 = 0; b0 < n; b0 += kThreads) {
++            for (int b0 = 0; b0 < n; b0 += kPick) {
+                 const int b = b0 + t;
+                 const int eq = b < n && lsa_okey(sc[b]) == thr;
+                 int eq_tot;
+-                const int eq_ex = lsa_excl_scan(eq, scan, &eq_tot);
++                const int eq_ex = lsa_excl_scan<kPick>(eq, scan, &eq_tot);
+                 const int take = eq && eq_base + eq_ex < need_eq;
+                 int tk_tot;
+-                const int tk_ex = lsa_excl_scan(take, scan, &tk_tot);
++                const int tk_ex = lsa_excl_scan<kPick>(take, scan, &tk_tot);
+                 if (take) cand[c_base + tk_ex] = lsa_cand(thr, b);
+                 eq_base += eq_tot;
+                 c_base += tk_tot;
+@@ -496,21 +594,38 @@ __global__ __launch_bounds__(kThreads) void lsa_pick_kernel(
+         C = top_p;
+     }
+     const int C2 = lsa_pow2(C > 0 ? C : 1);
+-    for (int i = C + t; i < C2; i += kThreads) cand[i] = ~0ull;
++    for (int i = C + t; i < C2; i += kPick) cand[i] = ~0ull;
+     __syncthreads();
+-    lsa_sort(cand, C2);
++    lsa_sort<kPick>(cand, C2);
+ 
+     /* ---- the keys each candidate reads past the sinks and before the window */
+-    auto members = [&](int b, int* blk) -> const int16_t* {
++    /* A bucket's members into `mm` (cap of them, -1 padded), 16 bytes a load where the row
++     * allows; false for a page outside the pool. */
++    auto members = [&](int b, int* blk, int16_t* mm) -> bool {
+         *blk = b / nb;
+         const int pg = row_bt[*blk];
+-        if (pg < 0 || pg >= bkt_pages) return nullptr;
+-        return (const int16_t*)(bkt + (long)pg * page_bytes + (long)nb * kDim * 2) +
+-               (long)(b % nb) * cap;
++        if (pg < 0 || pg >= bkt_pages) return false;
++        const int16_t* src = (const int16_t*)(bkt + (long)pg * page_bytes + (long)nb * kDim * 2) +
++                             (long)(b % nb) * cap;
++        if (cap % 8 == 0) {
++            const uint4* s4 = (const uint4*)src;
++            for (int v = 0; v < cap / 8; ++v) {
++                const uint4 w = s4[v];
++                const uint32_t u[4] = { w.x, w.y, w.z, w.w };
++                for (int h = 0; h < 4; ++h) {
++                    mm[v * 8 + 2 * h]     = (int16_t)(u[h] & 0xffffu);
++                    mm[v * 8 + 2 * h + 1] = (int16_t)(u[h] >> 16);
++                }
++            }
++        } else {
++            for (int k = 0; k < cap; ++k) mm[k] = src[k];
++        }
++        return true;
+     };
+-    for (int i = t; i < C; i += kThreads) {
++    for (int i = t; i < C; i += kPick) {
+         int blk = 0, c = 0;
+-        if (const int16_t* mm = members(lsa_cand_bucket(cand[i]), &blk))
++        int16_t mm[kMaxCap];
++        if (members(lsa_cand_bucket(cand[i]), &blk, mm))
+             for (int k = 0; k < cap && mm[k] >= 0; ++k) {
+                 const int at = blk * window + mm[k];
+                 c += at >= sink && at < ws;
+@@ -519,33 +634,34 @@ __global__ __launch_bounds__(kThreads) void lsa_pick_kernel(
+     }
+     __syncthreads();
+     int base = 0;
+-    for (int i0 = 0; i0 < C; i0 += kThreads) {
++    for (int i0 = 0; i0 < C; i0 += kPick) {
+         const int i = i0 + t;
+         int tot;
+-        const int ex = lsa_excl_scan(i < C ? cnt[i] : 0, scan, &tot);
++        const int ex = lsa_excl_scan<kPick>(i < C ? cnt[i] : 0, scan, &tot);
+         if (i < C) cnt[i] = base + ex;
+         base += tot;
+     }
+     const int E = base < top_k ? base : top_k;
+     __syncthreads();
+-    for (int i = t; i < C; i += kThreads) {
++    for (int i = t; i < C; i += kPick) {
+         int at0 = cnt[i];
+         if (at0 >= top_k) continue;
+         int blk = 0;
+-        if (const int16_t* mm = members(lsa_cand_bucket(cand[i]), &blk))
++        int16_t mm[kMaxCap];
++        if (members(lsa_cand_bucket(cand[i]), &blk, mm))
+             for (int k = 0; k < cap && mm[k] >= 0 && at0 < top_k; ++k) {
+                 const int at = blk * window + mm[k];
+                 if (at >= sink && at < ws) exp[at0++] = at;
+             }
+     }
+     const int E2 = lsa_pow2(E > 0 ? E : 1);
+-    for (int i = E + t; i < E2; i += kThreads) exp[i] = INT_MAX;
++    for (int i = E + t; i < E2; i += kPick) exp[i] = INT_MAX;
+     __syncthreads();
+-    lsa_sort(exp, E2);
++    lsa_sort<kPick>(exp, E2);
+ 
+     /* ---- sinks, expansion, window: one ascending list */
+     const int ns = sink < ws ? sink : ws, total = ns + E + (p - ws + 1);
+-    for (int i = t; i < sel_w; i += kThreads)
++    for (int i = t; i < sel_w; i += kPick)
+         out[i] = i < ns ? i : i < ns + E ? exp[i - ns] : i < total ? ws + (i - ns - E) : -1;
+     if (t == 0) nsel[m] = total;
+ }
+@@ -674,7 +790,8 @@ enum { LS_IQ = 0, LS_POS = 1, LS_CU = 2, LS_BKT = 3, LS_BT = 4, LS_SCORE = 5, LS
+ extern "C" int r4d_rad_lsa_select(const RadArgs* a, RadStream stream) {
+     const LsaSizes z = lsa_sizes(a);
+     if (r4d_geti_or(a, "dim", 0) != kDim || !z.ok(true)) return R4D_NO(RAD_E_SHAPE);
+-    if (lsa_pick_lds(z.top_p, z.top_k) + 4096 > 64 * 1024) return R4D_NO(RAD_E_SHAPE);
++    if (lsa_pick_lds(z.top_p, z.top_k) + kHist1 * 4 + kPick * 4 + 1024 > 64 * 1024)
++        return R4D_NO(RAD_E_SHAPE);
+     const RadTensor *iq = r4d_opt(a, LS_IQ), *po = r4d_opt(a, LS_POS), *cu = r4d_opt(a, LS_CU);
+     const RadTensor *bk = r4d_opt(a, LS_BKT), *bt = r4d_opt(a, LS_BT), *sc = r4d_opt(a, LS_SCORE);
+     const RadTensor *se = r4d_opt(a, LS_SEL), *ns = r4d_opt(a, LS_NSEL);
+@@ -693,6 +810,16 @@ extern "C" int r4d_rad_lsa_select(const RadArgs* a, RadStream stream) {
+     if (M < 1) return RAD_OK;
+     const long long live = sc->shape[1];
+     if (M > 65535 || live > INT_MAX - kThreads) return R4D_NO(RAD_E_SHAPE);
++    /* The first digit's counts, [M][2048], where the scratch holds them: the score launch counts
++     * across the device what the pick's one workgroup would. Without, the pick counts it. */
++    uint32_t* hist = a->scratch && a->scratch_bytes >= M * kHist1 * 4 ? (uint32_t*)a->scratch
++                                                                       : nullptr;
++    if (hist) {
++        const long n = (long)M * kHist1;
++        const int rc = R4D_EMIT(stream, lsa_hist_zero_kernel, dim3((unsigned)((n + kThreads - 1) / kThreads)),
++                                dim3(kThreads), 0, hist, n);
++        if (rc != RAD_OK) return rc;
++    }
+     if (live > 0) {
+         const int rc = R4D_EMIT(stream, lsa_score_kernel,
+                                 dim3((unsigned)((live + kThreads - 1) / kThreads), (unsigned)M),
+@@ -701,16 +828,24 @@ extern "C" int r4d_rad_lsa_select(const RadArgs* a, RadStream stream) {
+                                 (const uint8_t*)bk->data, (long)bk->shape[0],
+                                 (long)z.page_bytes(), (const int32_t*)bt->data,
+                                 (long)bt->stride[0], (long)bt->shape[1], (float*)sc->data,
+-                                (long)sc->stride[0], (int)live, (int)z.window, (int)z.nb());
++                                (long)sc->stride[0], (int)live, (int)z.window, (int)z.nb(), hist);
+         if (rc != RAD_OK) return rc;
+     }
+     const int cand_n = lsa_pow2((int)z.top_p);
+-    return R4D_EMIT(stream, lsa_pick_kernel, dim3((unsigned)M), dim3(kThreads),
++    return R4D_EMIT(stream, lsa_pick_kernel, dim3((unsigned)M), dim3(kPick),
+                     (uint32_t)lsa_pick_lds(z.top_p, z.top_k), (const float*)sc->data,
+                     (long)sc->stride[0], (int)live, (const int32_t*)po->data,
+                     (const int32_t*)cu->data, (int)n_seq, (const uint8_t*)bk->data,
+                     (long)bk->shape[0], (long)z.page_bytes(), (const int32_t*)bt->data,
+                     (long)bt->stride[0], (long)bt->shape[1], (int32_t*)se->data,
+                     (long)se->stride[0], (int)se->shape[1], (int32_t*)ns->data, (int)z.window,
+-                    (int)z.sink, (int)z.top_k, (int)z.top_p, (int)z.nb(), (int)z.cap, cand_n);
++                    (int)z.sink, (int)z.top_k, (int)z.top_p, (int)z.nb(), (int)z.cap, cand_n,
++                    (const uint32_t*)hist);
++}
++
++/* The first digit's counts for every row the band may carry: [M][2048] u32, 8 KiB a row. A
++ * launch with less (or none) counts the digit in the pick instead, with the same result. */
++extern "C" int64_t r4d_rad_lsa_select_scratch(const RadArgs* a) {
++    const long long M = r4d_geti_or(a, "M", 0);
++    return M > 0 ? (int64_t)M * kHist1 * 4 : 0;
+ }
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 1c7876f..bd63140 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -630,6 +630,7 @@ int64_t r4d_rad_qsa_select_scratch(const RadArgs*);
+ int r4d_rad_lsa_index_store (const RadArgs*, RadStream);
+ int r4d_rad_lsa_cluster     (const RadArgs*, RadStream);
+ int r4d_rad_lsa_select      (const RadArgs*, RadStream);
++int64_t r4d_rad_lsa_select_scratch(const RadArgs*);
+ int r4d_rad_kv_resolve      (const RadArgs*, RadStream);
+ int64_t r4d_rad_kv_resolve_scratch(const RadArgs*);
+ int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index 2135ac8..275f394 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -8954,8 +8954,9 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
+   ROW(cLsaCluster), NOTUNE,
+   nullptr, nullptr, r4d_rad_lsa_cluster, nullptr, nullptr, nullptr, nullptr },
+ 
+-/* Two launches: a thread a bucket scores, then a workgroup a row radix-selects the top_p,
+- * sorts them best first, cuts at top_k and sorts the expansion. */
++/* Two launches: a thread a bucket scores (and, given the scratch, counts the first radix digit
++ * across the device), then a workgroup a row radix-selects the top_p, sorts them best first, cuts
++ * at top_k and sorts the expansion. */
+ { "lsa_select_i32", "lsa_select", "attn",
+   "D-LSA decode selection: centroid scan, top-p, expansion to an ascending position list",
+   "64 index dims, top_p up to 2048 and top_k up to 8192 within the LDS, any context",
+@@ -8963,7 +8964,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
+   "i32 [M, >= sink + top_k + window] positions and lengths",
+   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+   ROW(cLsaSelect), NOTUNE,
+-  nullptr, nullptr, r4d_rad_lsa_select, nullptr, nullptr, nullptr, nullptr },
++  nullptr, nullptr, r4d_rad_lsa_select, r4d_rad_lsa_select_scratch, nullptr, nullptr, nullptr },
+ 
+ /* The only query-independent piece of QSA, hence a kernel of its own: a block key is fixed once
+  * its tokens exist, so it is built when the last arrives and read by every later query. */
+diff --git a/tests/lsa_cases.h b/tests/lsa_cases.h
+index 377e059..42739cf 100644
+--- a/tests/lsa_cases.h
++++ b/tests/lsa_cases.h
+@@ -22,6 +22,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
+ #include <functional>
+ #include <numeric>
+ #include <random>
+@@ -45,9 +46,10 @@ Opd opd(std::vector<T>& v, uint32_t dt, std::vector<int64_t> shape) {
+ }
+ 
+ /* Runs the entry point `symbol` over the operands (their host bytes in, every operand's bytes back
+- * out). */
++ * out). With `scratch`, the call gets the scratch `<symbol>_scratch` sizes from the parameters, if
++ * the library exports one. */
+ using Backend = std::function<int(const char* symbol, std::vector<Opd>& t,
+-                                  const std::vector<RadParam>& p)>;
++                                  const std::vector<RadParam>& p, bool scratch)>;
+ 
+ inline RadTensor tensor_of(const Opd& o, void* data) {
+     RadTensor t{};
+@@ -132,7 +134,7 @@ inline void index_store(const Backend& run, Tally& tl, int64_t T, int64_t n_head
+                            opd(cache, RAD_BF16, { blocks, 1, 16, D }), opd(iq, RAD_F32, { T, D }) };
+     std::vector<RadParam> p = { pint("head_dim", hd), pint("n_head", n_head), pint("n_head_kv", n_kv),
+                                 pint("rot", rot), pint("dim", D), pint("block_size", 16) };
+-    const int rc = run("r4d_rad_lsa_index_store", t, p);
++    const int rc = run("r4d_rad_lsa_index_store", t, p, false);
+     char what[160];
+     std::snprintf(what, sizeof what, "lsa_index_store T=%lld heads %lld/%lld hd %lld rot %lld",
+                   (long long)T, (long long)n_head, (long long)n_kv, (long long)hd, (long long)rot);
+@@ -194,7 +196,7 @@ inline void cluster(const Backend& run, Tally& tl, const rad_lsa::Geom& g,
+                            opd(idx, RAD_BF16, { ip.pages, 1, 16, D }), opd(ip.bt, RAD_I32, { n_seq, ip.cols }),
+                            opd(bkt, RAD_U8, { bp.pages, 1, g.window, PB / g.window }),
+                            opd(bp.bt, RAD_I32, { n_seq, bp.cols }) };
+-    const int rc = run("r4d_rad_lsa_cluster", t, geom_params(g));
++    const int rc = run("r4d_rad_lsa_cluster", t, geom_params(g), false);
+     char what[160];
+     std::snprintf(what, sizeof what, "lsa_cluster window %lld, %lld sequences, %lld rows, %lld blocks closing",
+                   (long long)g.window, (long long)n_seq, (long long)T, (long long)closed);
+@@ -211,7 +213,8 @@ inline void cluster(const Backend& run, Tally& tl, const rad_lsa::Geom& g,
+  * sequence, so blocks [0, ctx / window) are closed. `dup` gives that many buckets of each sequence
+  * one centroid, for ties. */
+ inline void select(const Backend& run, Tally& tl, const rad_lsa::Geom& g, int64_t n_seq, int64_t ctx,
+-                   const std::vector<std::pair<int64_t, int64_t>>& rows, int64_t dup, uint64_t seed) {
++                   const std::vector<std::pair<int64_t, int64_t>>& rows, int64_t dup, uint64_t seed,
++                   bool scratch) {
+     std::mt19937_64 rng(seed);
+     const int64_t D = g.dim, PB = g.page_bytes(), NB = g.buckets(), blocks = ctx / g.window;
+     Paged bp(rng, n_seq, ctx, g.window, 2);
+@@ -262,11 +265,14 @@ inline void select(const Backend& run, Tally& tl, const rad_lsa::Geom& g, int64_
+                            opd(bkt, RAD_U8, { bp.pages, 1, g.window, PB / g.window }),
+                            opd(bp.bt, RAD_I32, { n_seq, bp.cols }), opd(score, RAD_F32, { M, live }),
+                            opd(sel, RAD_I32, { M, W }), opd(nsel, RAD_I32, { M }) };
+-    const int rc = run("r4d_rad_lsa_select", t, geom_params(g));
+-    char what[200];
++    std::vector<RadParam> p = geom_params(g);
++    p.push_back(pint("M", M));
++    const int rc = run("r4d_rad_lsa_select", t, p, scratch);
++    char what[220];
+     std::snprintf(what, sizeof what, "lsa_select window %lld top_k %lld top_p %lld, %lld rows over %lld "
+-                  "buckets a sequence%s", (long long)g.window, (long long)g.top_k, (long long)g.top_p,
+-                  (long long)M, (long long)(blocks * NB), dup ? ", with ties" : "");
++                  "buckets a sequence%s%s", (long long)g.window, (long long)g.top_k, (long long)g.top_p,
++                  (long long)M, (long long)(blocks * NB), dup ? ", with ties" : "",
++                  scratch ? ", the first digit counted by the scan" : "");
+     tl.check(rc == RAD_OK, std::string(what) + ": status");
+     int64_t bad = 0;
+     for (int64_t m = 0; m < M; ++m) {
+@@ -280,6 +286,110 @@ inline void select(const Backend& run, Tally& tl, const rad_lsa::Geom& g, int64_
+     tl.check(bad == 0, std::string(what) + ": every row's list and length");
+ }
+ 
++/* ================================================================== the torch reference's fixtures */
++/* tests/mklsagolden.py dump: the design's sizes, the keys and queries beside the reference's
++ * buckets and reads (the reads over its own buckets, centroids in bf16). */
++struct Fixture {
++    rad_lsa::Geom g;
++    int64_t T = 0, Q = 0;
++    std::vector<uint16_t> keys;        /* [T][dim] */
++    std::vector<float>    queries;     /* [Q][dim] */
++    std::vector<int64_t>  positions;   /* [Q] */
++    std::vector<int32_t>  labels;      /* [blocks][pools] */
++    std::vector<float>    centroids;   /* [blocks * buckets][dim] f32 */
++    std::vector<int32_t>  members;     /* [blocks * buckets][cap], absolute, -1 padded */
++    std::vector<int32_t>  sel, lens;   /* [Q][width], [Q] */
++};
++
++inline bool load_fixture(const std::string& path, Fixture* f) {
++    std::ifstream in(path, std::ios::binary);
++    char magic[4];
++    int32_t ver = 0;
++    int64_t h[10];
++    if (!in.read(magic, 4) || std::memcmp(magic, "LSAF", 4) || !in.read((char*)&ver, 4) || ver != 1 ||
++        !in.read((char*)h, sizeof h))
++        return false;
++    rad_lsa::Geom& g = f->g;
++    g.window = h[0]; g.sink = h[1]; g.top_k = h[2]; g.top_p = h[3]; g.pool = h[4];
++    g.bucket = h[5]; g.cap = h[6]; g.dim = h[7];
++    f->T = h[8]; f->Q = h[9];
++    const int64_t D = g.dim, blocks = f->T / g.window, NB = g.buckets();
++    auto rd = [&](auto& v, int64_t n) {
++        v.resize((size_t)n);
++        return (bool)in.read((char*)v.data(), (std::streamsize)(n * sizeof(v[0])));
++    };
++    return rd(f->keys, f->T * D) && rd(f->queries, f->Q * D) && rd(f->positions, f->Q) &&
++           rd(f->labels, blocks * g.pools()) && rd(f->centroids, blocks * NB * D) &&
++           rd(f->members, blocks * NB * g.cap) && rd(f->sel, f->Q * g.width()) && rd(f->lens, f->Q);
++}
++
++/* The kernels against the reference itself, not through ref_lsa.h: lsa_cluster over every block of
++ * the fixture's keys (one sequence's prefill, the pages in order) for the buckets, and lsa_select
++ * over the reference's own buckets for the reads. Counts what differs; `*blocks_bad` and
++ * `*reads_bad` are the blocks whose bucket sets and the reads whose key sets differ. */
++inline bool fixture(const Backend& run, const std::string& path, int64_t* blocks, int64_t* blocks_bad,
++                    int64_t* cen_bad, int64_t* reads, int64_t* reads_bad) {
++    Fixture f;
++    if (!load_fixture(path, &f) || f.g.check()) return false;
++    const rad_lsa::Geom& g = f.g;
++    const int64_t D = g.dim, NB = g.buckets(), PB = g.page_bytes(), nblk = f.T / g.window;
++    /* ---- the clustering */
++    std::vector<uint16_t> idx = f.keys;
++    std::vector<int32_t> ibt((size_t)(f.T / 16)), bbt((size_t)nblk), pos((size_t)f.T), cu = { 0, (int32_t)f.T };
++    std::iota(ibt.begin(), ibt.end(), 0);
++    std::iota(bbt.begin(), bbt.end(), 0);
++    std::iota(pos.begin(), pos.end(), 0);
++    std::vector<uint8_t> bkt((size_t)(nblk * PB), 0);
++    std::vector<Opd> t = { opd(pos, RAD_I32, { f.T }), opd(cu, RAD_I32, { 2 }),
++                           opd(idx, RAD_BF16, { f.T / 16, 1, 16, D }), opd(ibt, RAD_I32, { 1, f.T / 16 }),
++                           opd(bkt, RAD_U8, { nblk, 1, g.window, PB / g.window }), opd(bbt, RAD_I32, { 1, nblk }) };
++    if (run("r4d_rad_lsa_cluster", t, geom_params(g), false) != RAD_OK) return false;
++    *blocks += nblk;
++    for (int64_t b = 0; b < nblk; ++b) {
++        const uint8_t* pg = &bkt[(size_t)(b * PB)];
++        const int16_t* mem = (const int16_t*)(pg + g.members_offset());
++        bool same = true;
++        for (int64_t i = 0; i < NB * g.cap; ++i) {
++            const int32_t want = f.members[(size_t)(b * NB * g.cap + i)];
++            same &= (mem[i] < 0 ? -1 : mem[i] + b * g.window) == want;
++        }
++        *blocks_bad += !same;
++        if (!same) continue;
++        const uint16_t* cen = (const uint16_t*)pg;
++        for (int64_t i = 0; i < NB * D; ++i)
++            *cen_bad += cen[i] != rad_lsa::f32_bf16(f.centroids[(size_t)(b * NB * D + i)]);
++    }
++    /* ---- the reads, over the reference's buckets */
++    for (int64_t b = 0; b < nblk; ++b) {
++        uint8_t* pg = &bkt[(size_t)(b * PB)];
++        uint16_t* cen = (uint16_t*)pg;
++        int16_t* mem = (int16_t*)(pg + g.members_offset());
++        for (int64_t i = 0; i < NB * D; ++i) cen[i] = rad_lsa::f32_bf16(f.centroids[(size_t)(b * NB * D + i)]);
++        for (int64_t i = 0; i < NB * g.cap; ++i) {
++            const int32_t m = f.members[(size_t)(b * NB * g.cap + i)];
++            mem[i] = (int16_t)(m < 0 ? -1 : m - b * g.window);
++        }
++    }
++    const int64_t M = f.Q, W = g.width();
++    std::vector<float> iq = f.queries, score((size_t)(M * nblk * NB));
++    std::vector<int32_t> qpos((size_t)M), qcu = { 0, (int32_t)M }, sel((size_t)(M * W)), nsel((size_t)M);
++    for (int64_t m = 0; m < M; ++m) qpos[(size_t)m] = (int32_t)f.positions[(size_t)m];
++    std::vector<Opd> u = { opd(iq, RAD_F32, { M, D }), opd(qpos, RAD_I32, { M }), opd(qcu, RAD_I32, { 2 }),
++                           opd(bkt, RAD_U8, { nblk, 1, g.window, PB / g.window }), opd(bbt, RAD_I32, { 1, nblk }),
++                           opd(score, RAD_F32, { M, nblk * NB }), opd(sel, RAD_I32, { M, W }), opd(nsel, RAD_I32, { M }) };
++    std::vector<RadParam> p = geom_params(g);
++    p.push_back(pint("M", M));
++    if (run("r4d_rad_lsa_select", u, p, true) != RAD_OK) return false;
++    *reads += M;
++    for (int64_t m = 0; m < M; ++m) {
++        std::vector<int32_t> want(f.sel.begin() + m * W, f.sel.begin() + m * W + f.lens[(size_t)m]);
++        std::sort(want.begin(), want.end());
++        const std::vector<int32_t> got(sel.begin() + m * W, sel.begin() + m * W + nsel[(size_t)m]);
++        *reads_bad += got != want;
++    }
++    return true;
++}
++
+ /* ================================================================== the set */
+ inline void run_all(const Backend& run, Tally& tl, bool large) {
+     index_store(run, tl, 37, 24, 4, 256, 64, 1);   /* Qwen3.5/3.8's attention */
+@@ -294,21 +404,25 @@ inline void run_all(const Backend& run, Tally& tl, bool large) {
+     cluster(run, tl, design, { { 512 * 3 + 511, 512 * 3 + 511 }, { 1000, 1000 }, { 100, 1300 } }, 2048, 4);
+     /* Rows before any closed block, on a boundary, past it, and deep; every bucket a candidate
+      * (small: 40 blocks of 8 over top_p 24 is the radix path; the 2-block sequence's rows the
+-     * other). */
+-    select(run, tl, small, 3, 64 * 40,
+-           { { 0, 5 }, { 0, 63 }, { 0, 64 }, { 0, 127 }, { 0, 64 * 40 - 1 }, { 1, 64 * 3 + 7 },
+-             { 1, 64 * 20 }, { 1, 64 * 20 + 1 }, { 1, 64 * 20 + 2 }, { 2, 64 * 39 + 63 } }, 0, 5);
+-    select(run, tl, small, 2, 64 * 30, { { 0, 64 * 29 + 3 }, { 0, 64 * 30 - 1 }, { 1, 64 * 25 } }, 30, 6);
+-    select(run, tl, small, 1, 64 * 2, { { 0, 64 * 2 - 1 }, { 0, 64 + 1 } }, 0, 7);
+-    if (large) {
+-        select(run, tl, design, 2, 512 * 24,
+-               { { 0, 512 * 24 - 1 }, { 0, 512 * 9 + 100 }, { 1, 512 * 23 }, { 1, 512 * 23 + 1 } }, 0, 8);
+-        select(run, tl, design, 1, 512 * 20, { { 0, 512 * 20 - 1 } }, 1100, 9);
+-    } else {
+-        rad_lsa::Geom mid = design;   /* the design's block, a smaller budget */
+-        mid.top_k = 512; mid.top_p = 96;
+-        select(run, tl, mid, 2, 512 * 8, { { 0, 512 * 8 - 1 }, { 1, 512 * 5 + 17 } }, 0, 8);
+-        select(run, tl, mid, 1, 512 * 6, { { 0, 512 * 6 - 1 } }, 120, 9);
++     * other). Each with the first digit counted by the pick and by the scan. */
++    for (bool scratch : { false, true }) {
++        select(run, tl, small, 3, 64 * 40,
++               { { 0, 5 }, { 0, 63 }, { 0, 64 }, { 0, 127 }, { 0, 64 * 40 - 1 }, { 1, 64 * 3 + 7 },
++                 { 1, 64 * 20 }, { 1, 64 * 20 + 1 }, { 1, 64 * 20 + 2 }, { 2, 64 * 39 + 63 } }, 0, 5, scratch);
++        select(run, tl, small, 2, 64 * 30, { { 0, 64 * 29 + 3 }, { 0, 64 * 30 - 1 }, { 1, 64 * 25 } }, 30, 6,
++               scratch);
++        select(run, tl, small, 1, 64 * 2, { { 0, 64 * 2 - 1 }, { 0, 64 + 1 } }, 0, 7, scratch);
++        if (large) {
++            select(run, tl, design, 2, 512 * 24,
++                   { { 0, 512 * 24 - 1 }, { 0, 512 * 9 + 100 }, { 1, 512 * 23 }, { 1, 512 * 23 + 1 } }, 0, 8,
++                   scratch);
++            select(run, tl, design, 1, 512 * 20, { { 0, 512 * 20 - 1 } }, 1100, 9, scratch);
++        } else {
++            rad_lsa::Geom mid = design;   /* the design's block, a smaller budget */
++            mid.top_k = 512; mid.top_p = 96;
++            select(run, tl, mid, 2, 512 * 8, { { 0, 512 * 8 - 1 }, { 1, 512 * 5 + 17 } }, 0, 8, scratch);
++            select(run, tl, mid, 1, 512 * 6, { { 0, 512 * 6 - 1 } }, 120, 9, scratch);
++        }
+     }
+ }
+ 
+diff --git a/tests/lsa_device_test.cpp b/tests/lsa_device_test.cpp
+index 2962545..7edf9b6 100644
+--- a/tests/lsa_device_test.cpp
++++ b/tests/lsa_device_test.cpp
+@@ -1,6 +1,6 @@
+ /* lsa_device_test.cpp -- D-LSA's index side (libr4d/r4d_lsa.hip) on a card, against libref/ref_lsa.h.
+  *
+- *   lsa_device_test LIB [--bench]
++ *   lsa_device_test LIB [--bench | --fixture FILE...]
+  *
+  * LIB is libr4d.so, or any library exporting r4d_rad_lsa_index_store, r4d_rad_lsa_cluster and
+  * r4d_rad_lsa_select. The fixtures are tests/lsa_cases.h's, as the emulator runs them
+@@ -12,6 +12,9 @@
+  * decode row at 128k and 512k of context (synthetic pages: unit centroids, eight keys a bucket),
+  * which is the per-layer cost a decode step pays sixteen times on Qwen3.8-27B.
+  *
++ * --fixture holds the kernels to the paper's torch reference directly, on tests/mklsagolden.py's
++ * dumps: the bucket sets of every block and the key sets of every read, counted where they differ.
++ *
+  * Exit status 77 when no card is visible, as the harness's skip. */
+ #include "rad_abi.h"
+ #include "lsa_cases.h"
+@@ -53,7 +56,8 @@ struct Lib {
+ /* The operands on the card for one call: copied in, the call, copied back. With `reps` > 0 the
+  * call is repeated that many times after a warm launch and the mean time returned in *us. */
+ int device_call(Lib& lib, hipStream_t st, const char* sym, std::vector<lsa_cases::Opd>& t,
+-                const std::vector<RadParam>& p, int reps = 0, double* us = nullptr) {
++                const std::vector<RadParam>& p, int reps = 0, double* us = nullptr,
++                bool scratch = false) {
+     std::vector<void*> dev(t.size(), nullptr);
+     std::vector<RadTensor> ts;
+     for (size_t i = 0; i < t.size(); ++i) {
+@@ -66,6 +70,16 @@ int device_call(Lib& lib, hipStream_t st, const char* sym, std::vector<lsa_cases
+     a.n_t = (int)ts.size();
+     a.p = p.data();
+     a.n_p = (int)p.size();
++    /* The scratch the library sizes for the call, poisoned, as the core's arena is not cleared. */
++    void* scr = nullptr;
++    const std::string ssym = std::string(sym) + "_scratch";
++    auto sfn = scratch ? reinterpret_cast<int64_t (*)(const RadArgs*)>(dlsym(lib.h, ssym.c_str())) : nullptr;
++    if (sfn && sfn(&a) > 0) {
++        a.scratch_bytes = sfn(&a);
++        hipcheck(hipMalloc(&scr, (size_t)a.scratch_bytes), "malloc scratch");
++        hipcheck(hipMemset(scr, 0xa5, (size_t)a.scratch_bytes), "poison scratch");
++        a.scratch = scr;
++    }
+     const lsa_cases::Launch fn = lib.at(sym);
+     int rc = fn(&a, (RadStream)st);
+     hipcheck(hipStreamSynchronize(st), sym);
+@@ -87,6 +101,7 @@ int device_call(Lib& lib, hipStream_t st, const char* sym, std::vector<lsa_cases
+         hipcheck(hipMemcpy(t[i].data, dev[i], t[i].bytes, hipMemcpyDeviceToHost), "copy out");
+         (void)hipFree(dev[i]);
+     }
++    if (scr) (void)hipFree(scr);
+     return rc;
+ }
+ 
+@@ -138,7 +153,15 @@ void bench(Lib& lib, hipStream_t st) {
+         std::printf("bench lsa_cluster      %5lld blocks closing     %9.1f us\n", (long long)closing, us);
+     }
+ 
+-    for (int64_t ctx : { 131072, 524288 }) {
++    /* The design's budget at two contexts, then a small budget and a batch of rows, which split the
++     * cost between the scan, the pick's fixed work and its rows. */
++    struct SelCase { int64_t ctx, top_k, top_p, rows; };
++    for (const SelCase sc : { SelCase{ 131072, 4096, 1024, 1 }, SelCase{ 524288, 4096, 1024, 1 },
++                              SelCase{ 524288, 512, 128, 1 }, SelCase{ 524288, 4096, 1024, 4 } }) {
++        rad_lsa::Geom gs = g;
++        gs.top_k = sc.top_k;
++        gs.top_p = sc.top_p;
++        const int64_t ctx = sc.ctx, R = sc.rows;
+         const int64_t blocks = ctx / g.window, buckets = blocks * NB;
+         std::vector<uint8_t> bkt((size_t)(blocks * PB));
+         for (int64_t b = 0; b < blocks; ++b) {
+@@ -151,20 +174,29 @@ void bench(Lib& lib, hipStream_t st) {
+                 for (int64_t m = 0; m < g.cap; ++m) mem[i * g.cap + m] = (int16_t)(m < g.bucket ? i * g.bucket + m : -1);
+             }
+         }
+-        std::vector<int32_t> bt((size_t)blocks);
+-        std::iota(bt.begin(), bt.end(), 0);
+-        std::vector<float> iq((size_t)D), score((size_t)buckets);
+-        float n = 0.0f;
+-        for (auto& x : iq) { x = nd(rng); n += x * x; }
+-        for (auto& x : iq) x /= std::sqrt(n);
+-        std::vector<int32_t> pos = { (int32_t)(ctx - 1) }, cu = { 0, 1 }, sel((size_t)g.width()), nsel(1);
+-        std::vector<Opd> t = { opd(iq, RAD_F32, { 1, D }), opd(pos, RAD_I32, { 1 }), opd(cu, RAD_I32, { 2 }),
++        /* R sequences sharing the pages, one decode row each. */
++        std::vector<int32_t> bt((size_t)(R * blocks));
++        for (int64_t r = 0; r < R; ++r) std::iota(bt.begin() + r * blocks, bt.begin() + (r + 1) * blocks, 0);
++        std::vector<float> iq((size_t)(R * D)), score((size_t)(R * buckets));
++        for (int64_t r = 0; r < R; ++r) {
++            float n = 0.0f;
++            for (int64_t d = 0; d < D; ++d) { iq[(size_t)(r * D + d)] = nd(rng); n += iq[(size_t)(r * D + d)] * iq[(size_t)(r * D + d)]; }
++            for (int64_t d = 0; d < D; ++d) iq[(size_t)(r * D + d)] /= std::sqrt(n);
++        }
++        std::vector<int32_t> pos((size_t)R, (int32_t)(ctx - 1)), cu((size_t)R + 1), sel((size_t)(R * gs.width())), nsel((size_t)R);
++        std::iota(cu.begin(), cu.end(), 0);
++        std::vector<Opd> t = { opd(iq, RAD_F32, { R, D }), opd(pos, RAD_I32, { R }), opd(cu, RAD_I32, { R + 1 }),
+                                opd(bkt, RAD_U8, { blocks, 1, g.window, PB / g.window }),
+-                               opd(bt, RAD_I32, { 1, blocks }), opd(score, RAD_F32, { 1, buckets }),
+-                               opd(sel, RAD_I32, { 1, g.width() }), opd(nsel, RAD_I32, { 1 }) };
+-        device_call(lib, st, "r4d_rad_lsa_select", t, geom_params(g), 20, &us);
+-        std::printf("bench lsa_select       1 row at %4lldk context  %9.1f us  (%d keys)\n",
+-                    (long long)(ctx / 1024), us, nsel[0]);
++                               opd(bt, RAD_I32, { R, blocks }), opd(score, RAD_F32, { R, buckets }),
++                               opd(sel, RAD_I32, { R, gs.width() }), opd(nsel, RAD_I32, { R }) };
++        std::vector<RadParam> ps = geom_params(gs);
++        ps.push_back(pint("M", R));
++        double us_noscr = 0.0;
++        device_call(lib, st, "r4d_rad_lsa_select", t, ps, 20, &us_noscr, false);
++        device_call(lib, st, "r4d_rad_lsa_select", t, ps, 20, &us, true);
++        std::printf("bench lsa_select       %lld row(s) at %4lldk, top_k %4lld top_p %4lld  %9.1f us  "
++                    "(%d keys; %.1f us without the scratch)\n", (long long)R, (long long)(ctx / 1024),
++                    (long long)sc.top_k, (long long)sc.top_p, us, nsel[0], us_noscr);
+     }
+ }
+ 
+@@ -192,10 +224,27 @@ int main(int argc, char** argv) {
+         bench(lib, st);
+         return 0;
+     }
++    if (argc > 2 && !std::strcmp(argv[2], "--fixture")) {
++        const lsa_cases::Backend card = [&](const char* sym, std::vector<lsa_cases::Opd>& t,
++                                            const std::vector<RadParam>& p, bool scratch) {
++            return device_call(lib, st, sym, t, p, 0, nullptr, scratch);
++        };
++        int64_t blocks = 0, blocks_bad = 0, cen_bad = 0, reads = 0, reads_bad = 0;
++        for (int i = 3; i < argc; ++i)
++            if (!lsa_cases::fixture(card, argv[i], &blocks, &blocks_bad, &cen_bad, &reads, &reads_bad)) {
++                std::fprintf(stderr, "%s: not a fixture, or a launch failed\n", argv[i]);
++                return 1;
++            }
++        std::printf("lsa_device_test fixtures: %d files; blocks %lld, bucket sets differing %lld "
++                    "(centroid elements differing in bf16 %lld); reads %lld, key sets differing %lld\n",
++                    argc - 3, (long long)blocks, (long long)blocks_bad, (long long)cen_bad,
++                    (long long)reads, (long long)reads_bad);
++        return 0;
++    }
+     lsa_cases::Tally tl;
+     const lsa_cases::Backend card = [&](const char* sym, std::vector<lsa_cases::Opd>& t,
+-                                        const std::vector<RadParam>& p) {
+-        return device_call(lib, st, sym, t, p);
++                                        const std::vector<RadParam>& p, bool scratch) {
++        return device_call(lib, st, sym, t, p, 0, nullptr, scratch);
+     };
+     const auto t0 = std::chrono::steady_clock::now();
+     lsa_cases::run_all(card, tl, true);
+diff --git a/tests/lsa_ref_test.cpp b/tests/lsa_ref_test.cpp
+index 6e218b6..741d77a 100644
+--- a/tests/lsa_ref_test.cpp
++++ b/tests/lsa_ref_test.cpp
+@@ -21,10 +21,10 @@
+ #include "rad_test.h"
+ 
+ #include "ref_lsa.h"
++#include "lsa_cases.h"
+ #include "lsa_golden.h"
+ 
+ #include <cinttypes>
+-#include <fstream>
+ #include <sstream>
+ 
+ namespace {
+@@ -199,38 +199,7 @@ TEST(frame) {
+     CHECK_EQ(out[(size_t)n], -1);
+ }
+ 
+-/* ---- fixtures from mklsagolden.py dump */
+-namespace {
+-
+-struct Fixture {
+-    Case c;
+-    std::vector<int32_t> labels, members, sel, lens;
+-    std::vector<float> centroids;
+-};
+-
+-bool load(const std::string& path, Fixture* f) {
+-    std::ifstream in(path, std::ios::binary);
+-    char magic[4];
+-    int32_t ver = 0;
+-    int64_t h[10];
+-    if (!in.read(magic, 4) || std::memcmp(magic, "LSAF", 4) || !in.read((char*)&ver, 4) || ver != 1 ||
+-        !in.read((char*)h, sizeof h))
+-        return false;
+-    Case& c = f->c;
+-    c.g.window = h[0]; c.g.sink = h[1]; c.g.top_k = h[2]; c.g.top_p = h[3]; c.g.pool = h[4];
+-    c.g.bucket = h[5]; c.g.cap = h[6]; c.g.dim = h[7]; c.T = h[8]; c.Q = h[9];
+-    const int64_t D = c.g.dim, blocks = c.T / c.g.window, NB = c.g.buckets();
+-    auto rd = [&](auto& v, int64_t n) {
+-        v.resize((size_t)n);
+-        return (bool)in.read((char*)v.data(), (std::streamsize)(n * sizeof(v[0])));
+-    };
+-    return rd(c.keys, c.T * D) && rd(c.queries, c.Q * D) && rd(c.positions, c.Q) &&
+-           rd(f->labels, blocks * c.g.pools()) && rd(f->centroids, blocks * NB * D) &&
+-           rd(f->members, blocks * NB * c.g.cap) && rd(f->sel, c.Q * c.g.width()) && rd(f->lens, c.Q);
+-}
+-
+-}  /* namespace */
+-
++/* ---- fixtures from mklsagolden.py dump (lsa_cases.h reads them) */
+ TEST(fixtures) {
+     const char* env = std::getenv("LSA_FIXTURES");
+     if (!env || !*env) SKIP("LSA_FIXTURES names no fixture (mklsagolden.py dump)");
+@@ -240,9 +209,11 @@ TEST(fixtures) {
+     std::string path;
+     int64_t all_blocks = 0, all_bad_blocks = 0, all_reads = 0, all_bad_reads = 0;
+     while (ss >> path) {
+-        Fixture f;
+-        REQUIRE(load(path, &f));
+-        const Case& c = f.c;
++        lsa_cases::Fixture f;
++        REQUIRE(lsa_cases::load_fixture(path, &f));
++        Case c;
++        c.g = f.g; c.T = f.T; c.Q = f.Q;
++        c.keys = f.keys; c.queries = f.queries; c.positions = f.positions;
+         REQUIRE(c.g.check() == nullptr);
+         const int64_t blocks = c.T / c.g.window, NB = c.g.buckets(), P = c.g.pools(), D = c.g.dim;
+         std::vector<uint8_t> pages;
+diff --git a/tests/r4d_emu/test_lsa.cpp b/tests/r4d_emu/test_lsa.cpp
+index f5b095c..f4614dc 100644
+--- a/tests/r4d_emu/test_lsa.cpp
++++ b/tests/r4d_emu/test_lsa.cpp
+@@ -12,11 +12,12 @@
+ extern "C" int r4d_rad_lsa_index_store(const RadArgs*, RadStream);
+ extern "C" int r4d_rad_lsa_cluster(const RadArgs*, RadStream);
+ extern "C" int r4d_rad_lsa_select(const RadArgs*, RadStream);
++extern "C" int64_t r4d_rad_lsa_select_scratch(const RadArgs*);
+ 
+ int main() {
+     lsa_cases::Tally tl;
+     const lsa_cases::Backend host = [](const char* sym, std::vector<lsa_cases::Opd>& t,
+-                                       const std::vector<RadParam>& p) {
++                                       const std::vector<RadParam>& p, bool scratch) {
+         const lsa_cases::Launch fn = !std::strcmp(sym, "r4d_rad_lsa_index_store") ? r4d_rad_lsa_index_store
+                                    : !std::strcmp(sym, "r4d_rad_lsa_cluster")     ? r4d_rad_lsa_cluster
+                                                                                    : r4d_rad_lsa_select;
+@@ -27,6 +28,12 @@ int main() {
+         a.n_t = (int)ts.size();
+         a.p = p.data();
+         a.n_p = (int)p.size();
++        std::vector<uint8_t> scr;
++        if (scratch && fn == r4d_rad_lsa_select) {
++            scr.assign((size_t)r4d_rad_lsa_select_scratch(&a), 0xa5);
++            a.scratch = scr.data();
++            a.scratch_bytes = (int64_t)scr.size();
++        }
+         return fn(&a, nullptr);
+     };
+     lsa_cases::run_all(host, tl, false);
+-- 
+2.53.0
+

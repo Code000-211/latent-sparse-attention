@@ -1,0 +1,93 @@
+From 7ca6d1801e5780200fdb9f1b037be79ade08f07c Mon Sep 17 00:00:00 2001
+From: Hero <caleb@calebgj.io>
+Date: Thu, 5 Nov 2026 23:19:16 +0000
+Subject: [PATCH 4/7] lsa: the map loader's test, on the published map when
+ LSA_MAP names it
+
+The sizes' nesting and a refused file run anywhere; with LSA_MAP the
+published Qwen3.8-27B map loads as sixteen [768, 64] layers at 3, 7, ..., 63,
+and with LSA_MAP_PROBE an element's bf16 is checked against the f32 torch
+reads from the same file.
+
+(cherry picked from commit c07b80be5582aa11cf3a4580e6f45738b8df20e8)
+---
+ tests/lsa_map_test.cpp | 67 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+ create mode 100644 tests/lsa_map_test.cpp
+
+diff --git a/tests/lsa_map_test.cpp b/tests/lsa_map_test.cpp
+new file mode 100644
+index 0000000..91e9744
+--- /dev/null
++++ b/tests/lsa_map_test.cpp
+@@ -0,0 +1,67 @@
++/* lsa_map_test.cpp -- D-LSA's map loader (core/lsa.h): the --lsa sidecar read without its pickle.
++ *
++ * The published map (`d-lsa-weights-v1`, e.g. qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt) is
++ * a torch zip of sixteen layers' W_Q_idx and W_K_idx, [768, 64] f32. It is not in the tree; with
++ * LSA_MAP naming it the `published_map` case loads it against Qwen3.8-27B's 64 layers and checks
++ * the layers, the shapes, the bf16 copy of a known element and the ABI view. The sizes' checks run
++ * without it. */
++#include "rad_test.h"
++
++#include "lsa.h"
++#include "rad_core.h"
++
++#include <cstring>
++
++using namespace rad;
++
++TEST(sizes_nest_as_the_design_requires) {
++    CHECK(lsa_sizes_refusal(512, 4, 4096, 1024, 4, 8, 16) == nullptr);
++    CHECK(lsa_sizes_refusal(512, 0, 4096, 1024, 4, 8, 16) == nullptr);
++    CHECK(lsa_sizes_refusal(512, 4, 4096, 1024, 3, 8, 16) != nullptr);   /* pool into bucket */
++    CHECK(lsa_sizes_refusal(500, 4, 4096, 1024, 4, 8, 16) != nullptr);   /* bucket into window */
++    CHECK(lsa_sizes_refusal(512, 4, 4096, 1024, 4, 8, 12) != nullptr);   /* cap under 2 buckets */
++    CHECK(lsa_sizes_refusal(512, 4, 4096, 128, 4, 8, 16) != nullptr);    /* top_p cannot fill top_k */
++}
++
++TEST(a_file_that_is_not_a_map_is_refused) {
++    Config cfg;
++    LsaMap m;
++    std::string why;
++    CHECK(lsa_map_load("/nonexistent/lsa.pt", 64, cfg, &m, &why) != RAD_OK);
++    CHECK(!why.empty());
++    CHECK(!m.loaded());
++}
++
++TEST(published_map) {
++    const char* path = std::getenv("LSA_MAP");
++    if (!path || !*path) SKIP("LSA_MAP names no map");
++    Config cfg;
++    LsaMap m;
++    std::string why;
++    REQUIRE_EQ(lsa_map_load(path, 64, cfg, &m, &why), RAD_OK);
++    CHECK_EQ(m.n_maps(), (int64_t)16);
++    CHECK_EQ(m.key_dim, (int64_t)768);
++    CHECK_EQ(m.index_dim, (int64_t)64);
++    for (int64_t l = 0; l < 64; ++l)
++        CHECK_EQ(m.map_of_layer[(size_t)l], l % 4 == 3 ? (int32_t)(l / 4) : -1);
++    CHECK_EQ(m.bytes(), (int64_t)(16 * 2 * 768 * 64 * 2));
++    /* One element against the f32 the file holds, when LSA_MAP_PROBE gives it: "map side row col
++     * value" (W_Q is side 0), its bf16 the round to nearest even of the value. */
++    if (const char* probe = std::getenv("LSA_MAP_PROBE")) {
++        int map = 0, side = 0, row = 0, col = 0;
++        float v = 0.0f;
++        REQUIRE(std::sscanf(probe, "%d %d %d %d %f", &map, &side, &row, &col, &v) == 5);
++        uint32_t u;
++        std::memcpy(&u, &v, 4);
++        const uint16_t want = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
++        CHECK_EQ(m.maps[(size_t)(((map * 2 + side) * 768 + row) * 64 + col)], want);
++    }
++    const RadLsaMap v = lsa_map_view(m, (const void*)0x1000);
++    CHECK_EQ(v.n_maps, (int64_t)16);
++    CHECK_EQ(v.window, (int64_t)512);
++    CHECK_EQ(v.top_k, (int64_t)4096);
++    CHECK_EQ(v.top_p, (int64_t)1024);
++    CHECK_EQ(v.map_of_layer[63], (int32_t)15);
++}
++
++RAD_TEST_MAIN()
+-- 
+2.53.0
+

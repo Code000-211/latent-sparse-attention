@@ -14,5 +14,6 @@ What is here is the operational surface: the commands, the config fields, and th
 | [development.md](development.md) | the local loop - what the gates fix, adding a dependency, and the torch pin |
 | [data.md](data.md) | tokenize a corpus, select distillation documents and prepare evaluation prompts |
 | [spark.md](spark.md) | Qwen3.8-Flash-Next's training-free PCA map on four DGX Sparks, step by step |
+| [radiance.md](radiance.md) | Qwen3.8-Flash-Next's PCA map served by Radiance on AMD, with the patches, the map's fit and the needle results |
 
 Setting the repository up is the [README](../../README.md), because that is true before any of this.

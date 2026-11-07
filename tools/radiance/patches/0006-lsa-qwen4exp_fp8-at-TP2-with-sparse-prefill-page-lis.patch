@@ -1,0 +1,1270 @@
+From 7dcca53eab987f2ccf74147f3b1b051d43e2d924 Mon Sep 17 00:00:00 2001
+From: lsa <lsa@local>
+Date: Sat, 7 Nov 2026 02:55:36 +0000
+Subject: [PATCH 6/7] lsa: qwen4exp_fp8 at TP2 with sparse prefill (page lists
+ through the QSA path)
+
+(cherry picked from commit 366fa81d0c043c534b173e6a212e0adfe63dd72c)
+---
+ arch/common/rad_block_attn_gated_fp8.h |  27 +++
+ arch/common/rad_block_lsa.h            | 225 ++++++++++++++++++++-----
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp     |  43 ++++-
+ docs/OPS.md                            |  28 ++-
+ libr4d/r4d_lsa.hip                     | 154 ++++++++++++++---
+ libr4d/r4d_plugin.h                    |   1 +
+ libr4d/r4d_rows.cpp                    |  49 +++++-
+ tests/arch_test.cpp                    |  82 ++++++++-
+ tests/lsa_cases.h                      | 153 ++++++++++++++++-
+ tests/r4d_emu/test_lsa.cpp             |   2 +
+ 10 files changed, 692 insertions(+), 72 deletions(-)
+
+diff --git a/arch/common/rad_block_attn_gated_fp8.h b/arch/common/rad_block_attn_gated_fp8.h
+index ca9365d..d3155e5 100644
+--- a/arch/common/rad_block_attn_gated_fp8.h
++++ b/arch/common/rad_block_attn_gated_fp8.h
+@@ -20,6 +20,7 @@
+ #define RAD_BLOCK_ATTN_GATED_FP8_H
+ 
+ #include "rad_fp8.h"
++#include "rad_block_lsa.h"
+ 
+ #include <cstring>
+ 
+@@ -87,6 +88,13 @@ struct AttnGatedFP8 {
+     /* `sel`'s row pitch is `topk + 1`; the extra slot is the partial page
+      * (r4d_qsa_select_bf16.hip). */
+     int64_t     qsa_topk = 0;
++    /* D-LSA in place of QSA (--lsa, arch/common/rad_block_lsa.h): set before declare() to the
++     * model's shared state, which must have been declared with this cache's page size. The block
++     * then points the qsa_* selection at D-LSA's page lists, declares the index side after its
++     * own ops, stores every row's index key after its KV store, and on a sparse step selects
++     * every row before the attention. QSA's sparse attention path is then D-LSA's, unchanged. */
++    LsaShared*  lsa_sh = nullptr;
++    LsaIndex    lsa{};
+     /* Query rows per sparse attention launch, a scratch budget. The decode kernel's split-KV
+      * partials are sized at declare from `max_seqs` and `q_len`, so issuing more rows than
+      * `max_seqs` means declaring a larger value, which grows the scratch arena (the maximum over
+@@ -210,6 +218,19 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+     const int64_t q_dim  = g.q_dim();
+     const int64_t kv_dim = g.kv_dim();
+     const int64_t qg_dim = 2 * q_dim;
++    if (lsa_sh) {
++        if (!lsa_sh->psel || !lsa_sh->pnsel || !lsa_sh->sequ || lsa_sh->pages < 1) return RAD_E_INVAL;
++        if (lsa_sh->page_bs != kv_block) {
++            fprintf(stderr, "radiance: --lsa: the page lists are for %lld-token pages, the "
++                            "attention's are %lld\n", (long long)lsa_sh->page_bs,
++                    (long long)kv_block);
++            return RAD_E_INVAL;
++        }
++        qsa_sel  = lsa_sh->psel;
++        qsa_nsel = lsa_sh->pnsel;
++        qsa_sequ = lsa_sh->sequ;
++        qsa_topk = lsa_sh->pages - 1;
++    }
+ 
+     /* Row spans, in the container's unsharded rows, used where the even shard is the wrong cut.
+      *
+@@ -495,6 +516,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
+                            RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x,
+                            0, {}, o_span_lo, o_span_hi));
++    if (lsa_sh) RAD_ARCH_TRY(lsa.declare(b, nm, g, l, n_rot, kv, lsa_sh, w.q, w.k));
+     return declare_out(b, add_out);
+ }
+ 
+@@ -681,6 +703,9 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
+     }
+ 
+     if (!fused_kv && !folded_stream) store_cache(c, kvb, slot, T);
++    /* D-LSA's index keys and closed blocks, from the normed and rotated rows every prologue
++     * leaves in w.q and w.k. */
++    if (lsa_sh) lsa.store(c, batch, w.q, w.k);
+ 
+     /* Sparse attention issues one row per query. `attn_paged` indexes its block table and length
+      * by row, and a row need not be a sequence, so T queries issued as T rows of q_len 1, each with
+@@ -708,6 +733,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
+                            (ring_bound || T == batch->n_seq || qsa_exact_to <= 0 ||
+                             reach > qsa_exact_to);
+     const bool gated = sparse && op_attn_gq;
++    /* D-LSA's lists for every row, prefill rows too, as page lists in qsa_sel / qsa_sequ. */
++    if (sparse && lsa_sh) lsa_select_pages(c, batch, lsa);
+     /* A streamed group's selection, per launch: make the rows' blocks resident and rewrite `sel`
+      * as ring slots, after this layer's store (a block copied in from the mirror must carry this
+      * step's tokens) and before the attention. A pass on the stage view leaves `sel` as block ids
+diff --git a/arch/common/rad_block_lsa.h b/arch/common/rad_block_lsa.h
+index 47a7962..6df1138 100644
+--- a/arch/common/rad_block_lsa.h
++++ b/arch/common/rad_block_lsa.h
+@@ -25,19 +25,29 @@
+  * block's buckets are a function of its tokens, as its KV is. The bucket group's `window`-token
+  * page makes the step's chunk quantum a multiple of the window (core/sched/geometry.cpp).
+  *
+- * The lists are the decode rows' only: a prefill chunk stores its index keys and closes its blocks
+- * but attends densely (block-sparse prefill is the paper's second phase). A sequence's rows close
+- * every block whose last key they write, so a rejected draft's rewrite of that key clusters the
+- * block again when it is written next.
++ * A block that asks for pages (LsaShared::declare's `page_bs`, the fp8 gated attention) selects
++ * every row of a step, prefill rows too, a chunk of `sel_rows` at a time, and turns each row's list
++ * into the attention's page list (`lsa_pages`): the attention then runs the paged per-row sparse
++ * path QSA uses (one row a query at q_len 1, a page list and `seqused` in place of the block table
++ * and length), with no new attention kernel. A prefill row sees only the blocks closed before its
++ * own position, and the step's blocks are clustered before any row selects, so the read is causal.
++ * A page the list cuts into is read whole: a superset of the list by at most block_size - 1 earlier
++ * keys a cut (docs/OPS.md `lsa_pages`). Without pages the lists are the decode rows' only: a
++ * prefill chunk stores its index keys and closes its blocks but attends densely. A sequence's rows
++ * close every block whose last key they write, so a rejected draft's rewrite of that key clusters
++ * the block again when it is written next.
+  *
+  * Under tensor parallelism an index key sums every KV head and an index query every query head of
+- * the layer, so each rank holds a partial projection; the all_reduce that would join them is not
+- * declared yet, and a deployment above one rank is refused. */
++ * the layer. A rank whose heads are a plain split of the layer's (no replication, no attention-zero
++ * rank) writes its heads' sums to `part`, an exact f32 all_reduce joins them, and the store
++ * finishes from the sum; with one KV head a rank the sum is the one-rank sum to the bit. */
+ #ifndef RAD_BLOCK_LSA_H
+ #define RAD_BLOCK_LSA_H
+ 
+ #include "rad_arch.h"
+ 
++#include <vector>
++
+ namespace rad {
+ namespace arch {
+ 
+@@ -50,27 +60,41 @@ struct LsaShared {
+     rad_buf score = 0;    /* [rows, live_max] f32 bucket scores */
+     rad_buf sel = 0;      /* [rows, width] i32 key positions, ascending, -1 padded */
+     rad_buf nsel = 0;     /* [rows] i32 */
+-    int64_t rows = 0;     /* the decode rows one step may carry */
++    rad_buf part = 0;     /* [max_tok, 128] f32 the heads' partial sums, above one rank */
++    /* With pages: every row of a step, as attention page lists, [max_tok, pages] i32 (-1 padded),
++     * their counts and the tokens they cover (lsa_pages). */
++    rad_buf psel = 0, pnsel = 0, sequ = 0;
++    int64_t pages = 0;    /* the page list's width */
++    int64_t page_bs = 0;  /* the attention cache's block size; 0 without pages */
++    int64_t rows = 0;     /* the rows one select launch may carry */
+     int64_t live_max = 0; /* the buckets of a context of max_ctx */
+     int64_t width = 0;    /* sink + top_k + window: the contract's S_max */
+     int64_t nb = 0;       /* buckets a cluster block */
+     int64_t page_hd = 0;  /* kv_lsa_bkt's declared head_dim, in bytes: a page is 2 * window * this */
+ 
+-    int declare(RadBuilder* b, Names& nm, const Geom& g, int64_t n_rot, const RadLsaMap* m) {
++    /* `page_bs` > 0 asks for every row's page list over an attention cache of that block size
++     * (see the file comment), a step's rows selected in `chunks` launches of max_tok / chunks
++     * rows. A chunk's first row is a declared parameter, so a sizing declare (a smaller max_tok)
++     * must pass the real declare's `rows` as `rows_fixed` to declare the same ops. */
++    int64_t chunks = 1;
++    int declare(RadBuilder* b, Names& nm, const Geom& g, int64_t n_rot, const RadLsaMap* m,
++                int64_t page_bs_ = 0, int64_t chunks_ = 1, int64_t rows_fixed = 0) {
+         map = m;
+         const int64_t free = g.head_dim - n_rot;
+-        if (g.world > 1) {
+-            fprintf(stderr, "radiance: --lsa: D-LSA's index key sums every KV head and its query "
+-                            "every query head of a layer; at %d ranks each holds a partial "
+-                            "projection, and the all_reduce that joins them is not declared yet. "
+-                            "Serve it at one rank.\n", g.world);
++        const int64_t kv_all = g.world > 1 ? g.n_head_kv_all : g.n_head_kv;
++        if (g.world > 1 && (g.attn_zero || g.attn_world != g.world ||
++                            g.n_head_kv * g.world != g.n_head_kv_all)) {
++            fprintf(stderr, "radiance: --lsa: at %d ranks the layer's %lld KV heads are not split "
++                            "evenly over the ranks (replicated or attention-zero); D-LSA's index "
++                            "sum needs each head on exactly one rank.\n", g.world,
++                    (long long)g.n_head_kv_all);
+             return RAD_E_UNSUPPORTED;
+         }
+-        if (m->index_dim != 64 || m->key_dim != g.n_head_kv * free || g.n_head % g.n_head_kv) {
++        if (m->index_dim != 64 || m->key_dim != kv_all * free || g.n_head % g.n_head_kv) {
+             fprintf(stderr, "radiance: --lsa: the maps are [%lld, %lld]; this model's index input "
+                             "is %lld KV heads of %lld position-free dims (%lld), into 64 index "
+                             "dims\n", (long long)m->key_dim, (long long)m->index_dim,
+-                    (long long)g.n_head_kv, (long long)free, (long long)(g.n_head_kv * free));
++                    (long long)kv_all, (long long)free, (long long)(kv_all * free));
+             return RAD_E_SHAPE;
+         }
+         nb = m->window / m->bucket;
+@@ -83,13 +107,40 @@ struct LsaShared {
+         }
+         page_hd = nb * (64 + m->bucket_cap) * 2 / (2 * m->window);
+         rows = g.max_seqs * (1 + (g.max_spec > 0 ? g.max_spec : 0));
++        chunks = page_bs_ > 0 && chunks_ > 0 ? chunks_ : 1;
++        if (page_bs_ > 0) {
++            const int64_t per = rows_fixed > 0 ? rows_fixed : (g.max_tok + chunks - 1) / chunks;
++            if (per > rows) rows = per;
++            if (rows > 65535) return RAD_E_INVAL;
++        }
+         live_max = (g.max_ctx + m->window - 1) / m->window * nb;
+         width = m->sink + m->top_k + m->window;
+         iq    = decl_b(b, nm.f("lsa_iq"),    RAD_F32, {g.max_tok, 64});
+         score = decl_b(b, nm.f("lsa_score"), RAD_F32, {rows, live_max});
+         sel   = decl_b(b, nm.f("lsa_sel"),   RAD_I32, {rows, width});
+         nsel  = decl_b(b, nm.f("lsa_nsel"),  RAD_I32, {rows});
+-        return iq && score && sel && nsel ? RAD_OK : RAD_E_INVAL;
++        if (!iq || !score || !sel || !nsel) return RAD_E_INVAL;
++        if (g.world > 1 && !(part = decl_b(b, nm.f("lsa_part"), RAD_F32, {g.max_tok, 128})))
++            return RAD_E_INVAL;
++        page_bs = page_bs_;
++        if (page_bs > 0) {
++            /* The pages a list can touch: the sinks' and the window's (each cut once at most), and
++             * the expansion's -- whole pools of `pool` tokens, aligned in their block, so whole
++             * pages when the pool is a multiple of the page (one cut, at top_k), else at most two
++             * pages a pool. Never more than the list's positions. */
++            const int64_t cdiv_s = (m->sink + page_bs - 1) / page_bs + 1;
++            const int64_t cdiv_w = (m->window + page_bs - 1) / page_bs + 1;
++            const int64_t exp_p  = m->pool % page_bs == 0
++                                       ? (m->top_k + page_bs - 1) / page_bs + 1
++                                       : 2 * ((m->top_k + m->pool - 1) / m->pool);
++            pages = cdiv_s + cdiv_w + exp_p;
++            if (pages > width) pages = width;
++            psel  = decl_b(b, nm.f("lsa_psel"),  RAD_I32, {g.max_tok, pages});
++            pnsel = decl_b(b, nm.f("lsa_pnsel"), RAD_I32, {g.max_tok});
++            sequ  = decl_b(b, nm.f("lsa_sequ"),  RAD_I32, {g.max_tok});
++            if (!psel || !pnsel || !sequ) return RAD_E_INVAL;
++        }
++        return RAD_OK;
+     }
+ };
+ 
+@@ -101,12 +152,18 @@ struct LsaIndex {
+     const LsaShared* sh = nullptr;
+     const void*      map = nullptr;   /* this layer's [2][key_dim][64] bf16, W_Q first, on the card */
+     rad_op op_store = 0, op_cluster = 0, op_select = 0;
++    /* Above one rank: the partial store, the all-reduce of its sums, and the finishing store. */
++    rad_op op_part = 0, op_ar = 0, op_fin = 0;
++    /* With pages: a select and a pages op a chunk of the step's rows, chunk k at row0 k * rows
++     * (a parameter is fixed at declare, so a chunk is its own op). op_sel[0] is op_select. */
++    std::vector<rad_op> op_sel, op_pages;
++    rad_kvgroup attn_kv = 0;
+ 
+     /* After the attention's own ops (its group's block size is read here). `q` and `k` are the
+      * block's normed and rotated query and key rows. */
+     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, int64_t rotary_dim,
+-                rad_kvgroup attn_kv, LsaShared* s, rad_buf q, rad_buf k) {
+-        g = geom; layer = l; n_rot = rotary_dim; sh = s;
++                rad_kvgroup attn_kv_, LsaShared* s, rad_buf q, rad_buf k) {
++        g = geom; layer = l; n_rot = rotary_dim; sh = s; attn_kv = attn_kv_;
+         const RadLsaMap* m = s->map;
+         if (l < 0 || l >= m->n_layers || m->map_of_layer[l] < 0) {
+             fprintf(stderr, "radiance: --lsa: the maps have none for full-attention layer %d\n", l);
+@@ -125,14 +182,45 @@ struct LsaIndex {
+             s->idx = rad_decl_kv_group(b, nm.f("kv_lsa_idx"), &d);
+             RAD_ARCH_TRY(rad_kv_group_dense_read(b, s->idx));
+         }
+-        op_store = rw(b, RAD_OP(b, "lsa_index_store",
+-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+-                                     RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", g.n_head_kv),
+-                                     RAD_INT("rot", n_rot), RAD_INT("dim", 64),
+-                                     RAD_INT("block_size", bs)),
+-                          RAD_NOWEIGHTS),
+-                      {q, k}, {s->iq});
+-        if (!op_store || rad_kv_block_size(b, s->idx) != bs) return RAD_E_INVAL;
++        if (g.world <= 1) {
++            op_store = rw(b, RAD_OP(b, "lsa_index_store",
++                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
++                                         RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", g.n_head_kv),
++                                         RAD_INT("rot", n_rot), RAD_INT("dim", 64),
++                                         RAD_INT("block_size", bs)),
++                              RAD_NOWEIGHTS),
++                          {q, k}, {s->iq});
++            if (!op_store || rad_kv_block_size(b, s->idx) != bs) return RAD_E_INVAL;
++        } else {
++            /* This rank's heads are the run from attn_rank * n_head_kv (a plain split, checked in
++             * LsaShared::declare); the map holds all of the layer's. */
++            const int64_t kv0 = (int64_t)g.attn_rank * g.n_head_kv;
++            op_part = rw(b, RAD_OP(b, "lsa_index_store",
++                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
++                                        RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", g.n_head_kv),
++                                        RAD_INT("rot", n_rot), RAD_INT("dim", 64),
++                                        RAD_INT("block_size", bs), RAD_INT("map_kv", g.n_head_kv_all),
++                                        RAD_INT("kv0", kv0), RAD_INT("mode", 1)),
++                             RAD_NOWEIGHTS),
++                         {q, k}, {s->part});
++            op_ar = rw(b, RAD_OP(b, "all_reduce",
++                           RAD_PARAMS(RAD_INT("world_size", g.world),
++                                      RAD_RANGE("numel", 128, g.max_tok * 128),
++                                      RAD_STR("dtype", "fp32"), RAD_INT("exact", 1),
++                                      RAD_INT("min_bytes", g.wire_min_bytes)),
++                           RAD_NOWEIGHTS),
++                       {s->part}, {s->part});
++            op_fin = rw(b, RAD_OP(b, "lsa_index_store",
++                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
++                                       RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", g.n_head_kv),
++                                       RAD_INT("rot", n_rot), RAD_INT("dim", 64),
++                                       RAD_INT("block_size", bs), RAD_INT("map_kv", g.n_head_kv_all),
++                                       RAD_INT("kv0", kv0), RAD_INT("mode", 2)),
++                            RAD_NOWEIGHTS),
++                        {q, k, s->part}, {s->iq});
++            if (!op_part || !op_ar || !op_fin || rad_kv_block_size(b, s->idx) != bs)
++                return RAD_E_INVAL;
++        }
+         RAD_ARCH_TRY(rad_bind_layer_kv(b, l, s->idx));
+ 
+         /* A closed block's buckets, a page a block. */
+@@ -157,15 +245,33 @@ struct LsaIndex {
+         if (!op_cluster) return RAD_E_INVAL;
+         RAD_ARCH_TRY(rad_bind_layer_kv(b, l, s->bkt));
+ 
+-        op_select = rw(b, RAD_OP(b, "lsa_select",
+-                           RAD_PARAMS(RAD_RANGE("M", 1, s->rows), RAD_INT("window", m->window),
+-                                      RAD_INT("sink", m->sink), RAD_INT("top_k", m->top_k),
+-                                      RAD_INT("top_p", m->top_p), RAD_INT("pool", m->pool),
+-                                      RAD_INT("bucket", m->bucket), RAD_INT("cap", m->bucket_cap),
+-                                      RAD_INT("dim", 64)),
+-                           RAD_NOWEIGHTS),
+-                       {s->iq}, {s->score, s->sel, s->nsel});
+-        return op_select ? RAD_OK : RAD_E_INVAL;
++        const int64_t chunks = s->chunks;
++        for (int64_t k = 0; k < chunks; ++k) {
++            const int64_t row0 = k * s->rows;
++            const rad_op os = rw(b, RAD_OP(b, "lsa_select",
++                                     RAD_PARAMS(RAD_RANGE("M", 1, s->rows), RAD_INT("window", m->window),
++                                                RAD_INT("sink", m->sink), RAD_INT("top_k", m->top_k),
++                                                RAD_INT("top_p", m->top_p), RAD_INT("pool", m->pool),
++                                                RAD_INT("bucket", m->bucket),
++                                                RAD_INT("cap", m->bucket_cap), RAD_INT("dim", 64),
++                                                RAD_INT("row0", row0)),
++                                     RAD_NOWEIGHTS),
++                                 {s->iq}, {s->score, s->sel, s->nsel});
++            if (!os) return RAD_E_INVAL;
++            op_sel.push_back(os);
++            if (s->page_bs > 0) {
++                const rad_op op = rw(b, RAD_OP(b, "lsa_pages",
++                                         RAD_PARAMS(RAD_RANGE("M", 1, s->rows),
++                                                    RAD_INT("block_size", s->page_bs),
++                                                    RAD_INT("row0", row0)),
++                                         RAD_NOWEIGHTS),
++                                     {s->sel, s->nsel}, {s->psel, s->pnsel, s->sequ});
++                if (!op) return RAD_E_INVAL;
++                op_pages.push_back(op);
++            }
++        }
++        op_select = op_sel[0];
++        return RAD_OK;
+     }
+ 
+     /* Every row's index key and query, from the normed and rotated q and k, and every block the
+@@ -174,10 +280,23 @@ struct LsaIndex {
+         const RadKVGroupBatch* ib = kv_batch(batch, sh->idx);
+         const RadKVGroupBatch* bb = kv_batch(batch, sh->bkt);
+         const int64_t T = batch->n_tok, S = batch->n_seq;
+-        RAD_ISSUE(c, op_store, brows(q, T), brows(k, T),
+-                  praw2(map, RAD_BF16, 2 * sh->map->key_dim, 64),
+-                  praw(ib ? ib->slot_mapping : nullptr, RAD_I32, T), kv_cache(sh->idx, layer),
+-                  brows(sh->iq, T));
++        if (op_store) {
++            RAD_ISSUE(c, op_store, brows(q, T), brows(k, T),
++                      praw2(map, RAD_BF16, 2 * sh->map->key_dim, 64),
++                      praw(ib ? ib->slot_mapping : nullptr, RAD_I32, T), kv_cache(sh->idx, layer),
++                      brows(sh->iq, T));
++        } else {
++            /* The partial launch stores nothing and writes no query: no cache, no iq. */
++            RAD_ISSUE(c, op_part, brows(q, T), brows(k, T),
++                      praw2(map, RAD_BF16, 2 * sh->map->key_dim, 64),
++                      praw(ib ? ib->slot_mapping : nullptr, RAD_I32, T), RAD_NONE, RAD_NONE,
++                      brows(sh->part, T));
++            RAD_ISSUE_N(c, op_ar, T * 128, brows(sh->part, T), RAD_NONE);
++            RAD_ISSUE(c, op_fin, brows(q, T), brows(k, T),
++                      praw2(map, RAD_BF16, 2 * sh->map->key_dim, 64),
++                      praw(ib ? ib->slot_mapping : nullptr, RAD_I32, T), kv_cache(sh->idx, layer),
++                      brows(sh->iq, T), brows(sh->part, T));
++        }
+         RAD_ISSUE(c, op_cluster, praw(batch->positions, RAD_I32, T),
+                   praw(batch->cu_seqlens, RAD_I32, S + 1), kv_cache(sh->idx, layer),
+                   praw2(ib ? ib->block_table : nullptr, RAD_I32, S, ib ? ib->block_table_pitch : 0),
+@@ -201,6 +320,34 @@ struct LsaIndex {
+     }
+ };
+ 
++/* Every row's list and page list (sh->psel, sh->pnsel, sh->sequ, rows [0, T)), a chunk of
++ * sh->rows rows a launch, the chunk's rows at `row0` into the step's cu_seqlens. After store(). */
++inline void lsa_select_pages(RadCtx* c, const RadBatch* batch, const LsaIndex& x) {
++    const LsaShared* sh = x.sh;
++    const RadLsaMap* m = sh->map;
++    const RadKVGroupBatch* bb = kv_batch(batch, sh->bkt);
++    const RadKVGroupBatch* ab = kv_batch(batch, x.attn_kv);
++    const int64_t T = batch->n_tok, S = batch->n_seq;
++    int64_t live = ((int64_t)batch->max_ctx_len + batch->max_q_len) / m->window * sh->nb;
++    if (live > sh->live_max) live = sh->live_max;
++    if (live < 1) live = 1;
++    for (size_t k = 0; k < x.op_pages.size(); ++k) {
++        const int64_t off = (int64_t)k * sh->rows;
++        if (off >= T) break;
++        const int64_t n = T - off < sh->rows ? T - off : sh->rows;
++        RAD_ISSUE_N(c, x.op_sel[k], n, brow_slice(sh->iq, off, n, 64),
++                    praw(batch->positions ? batch->positions + off : nullptr, RAD_I32, n),
++                    praw(batch->cu_seqlens, RAD_I32, S + 1), kv_cache(sh->bkt, x.layer),
++                    praw2(bb ? bb->block_table : nullptr, RAD_I32, S, bb ? bb->block_table_pitch : 0),
++                    bcol(sh->score, 0, live, n), brows(sh->sel, n), brows(sh->nsel, n));
++        RAD_ISSUE_N(c, x.op_pages[k], n, brows(sh->sel, n), brows(sh->nsel, n),
++                    praw(batch->cu_seqlens, RAD_I32, S + 1),
++                    praw2(ab ? ab->block_table : nullptr, RAD_I32, S, ab ? ab->block_table_pitch : 0),
++                    brow_slice(sh->psel, off, n, sh->pages), brow_slice(sh->pnsel, off, n, 1),
++                    brow_slice(sh->sequ, off, n, 1));
++    }
++}
++
+ }  /* namespace arch */
+ }  /* namespace rad */
+ 
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index d5cca08..526c3e5 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -128,6 +128,9 @@ struct Model {
+     QsaIndexer::Config qsacfg{};
+     QsaIndexer::Wire   qsaw{};
+     rad_kvgroup        kv_qsa_bkey = 0;   /* created by the first QSA layer's declare() */
++    /* --lsa: D-LSA's index side in place of the trunk's QSA indexers (rad_block_lsa.h), its
++     * page lists read by the same sparse attention path. */
++    LsaShared          lsa{};
+ 
+     int64_t n_rot = 0;
+ 
+@@ -720,7 +723,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+          *
+          * `n_head_kv` 1 and `state_dim` {ring, head_dim}: `ring` raw keys, a few KiB per layer per
+          * sequence. */
+-        if (m.qsacfg.heads > 0 && m.qsacfg.head_dim > 0 && m.qsacfg.ring > 0) {
++        /* Not under --lsa without the MTP head: no QSA indexer is then declared. */
++        const bool qsa_any = !ctx->lsa || (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
++                                                     "mtp_num_hidden_layers", 0) > 0 &&
++                                           g.max_spec > 0);
++        if (m.qsacfg.heads > 0 && m.qsacfg.head_dim > 0 && m.qsacfg.ring > 0 && qsa_any) {
+             RadKVGroupDecl td{};
+             td.kind         = RAD_KV_LINEAR;
+             td.dtype        = g.act_dtype;
+@@ -805,7 +812,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+     if (g.w_bf16) m.b_gate = decl_b(b, nm.f("attn_gate"), g.act_dtype, {T, q_dim});
+     /* The QSA indexer's planes, shared by every full-attention layer like `attn_out`. Declared
+      * only when the checkpoint carries an indexer; otherwise the layer's declare() is a no-op. */
+-    if (m.qsacfg.heads > 0 && m.qsacfg.head_dim > 0) {
++    /* Under --lsa the trunk's full-attention layers select with D-LSA and the QSA planes serve
++     * only the MTP head, so a deployment that does not speculate declares none of them. */
++    const bool lsa_on  = ctx->lsa != nullptr;
++    const bool mtp_on  = meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
++                                   "mtp_num_hidden_layers", 0) > 0 && g.max_spec > 0;
++    if (m.qsacfg.heads > 0 && m.qsacfg.head_dim > 0 && (!lsa_on || mtp_on)) {
+         m.qsaw.qk = decl_b(b, nm.f("qsa_qk"), g.act_dtype,
+                            { g.max_tok, (m.qsacfg.heads + 1) * m.qsacfg.head_dim });
+         m.qsaw.q  = decl_b(b, nm.f("qsa_q"),  g.act_dtype,
+@@ -849,6 +861,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+             !m.qsaw.sequ)
+             return RAD_E_INVAL;
+     }
++    /* D-LSA: every row's lists as 4-token page lists (the attention's QSA paging), the score
++     * plane a quarter of the step at a time. */
++    if (lsa_on) {
++        /* A sizing declare keeps the real declare's chunk rows: each chunk's first row is a
++         * declared parameter (rad_block_lsa.h). */
++        RAD_ARCH_TRY(m.lsa.declare(b, nm, g, m.n_rot, ctx->lsa, 4, 4,
++                                   ctx->shape_probe ? g_model[ctx->rank].lsa.rows : 0));
++        rad_note(b, "D-LSA: window %lld, %lld sinks, top %lld keys of %lld buckets, at most %lld "
++                    "keys (%lld pages of 4) a query at prefill and decode in place of the QSA "
++                    "indexer; dense to %lld tokens of context, where it selects every key",
++                 (long long)ctx->lsa->window, (long long)ctx->lsa->sink,
++                 (long long)ctx->lsa->top_k, (long long)ctx->lsa->top_p, (long long)m.lsa.width,
++                 (long long)m.lsa.pages,
++                 (long long)(ctx->lsa->sink + ctx->lsa->top_k + ctx->lsa->window));
++    }
+ 
+     m.a_in.x = decl_b(b, nm.f("gdn_in"), g.act_dtype, {T, conv_dim + v_dim});
+     RAD_ARCH_TRY(m.a_in.declare_qs(b, nm, g, "gdn_in", conv_dim + v_dim));
+@@ -1092,7 +1119,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+              *
+              * Below the indexer's budget the selection is every visible block, so sparse and dense
+              * paths must give identical text; any difference is a defect. */
+-            if (m.qsaw.qk) {
++            if (lsa_on) {
++                /* The page lists replace QSA's selection (AttnGatedFP8::lsa_sh); the attention
++                 * is dense up to where D-LSA selects every key: sinks, top_k and the window. */
++                lay.attn.lsa_sh       = &m.lsa;
++                lay.attn.qsa_exact_to = ctx->lsa->sink + ctx->lsa->top_k + ctx->lsa->window;
++            } else if (m.qsaw.qk) {
+                 lay.attn.qsa_sel      = m.qsaw.sel;
+                 lay.attn.qsa_nsel     = m.qsaw.nsel;
+                 lay.attn.qsa_sequ     = m.qsaw.sequ;
+@@ -1113,7 +1145,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+             /* The indexer, after the attention block so its ops sit where the sparse attention
+              * reads them. It reads the same normed fp8 input as the projections
+              * (arch/common/rad_qsa.h, docs/QSA.md). */
+-            if (m.qsaw.qk) {
++            if (m.qsaw.qk && !lsa_on) {
+                 QsaIndexer::Config qc = m.qsacfg;
+                 qc.mode    = lay.attn.mode;
+                 qc.qk_proj = nm.ckpt("%s.%lld.self_attn.indexer.index_qk_proj.weight",
+@@ -1717,6 +1749,9 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+     }
+     /* The gated residual applies a control vector after every block's write (HcProject). */
+     out->control_vector_ok = 1;
++    /* --lsa: the full-attention layers take D-LSA's index side (rad_block_lsa.h), at one rank or
++     * a plain head split over several. */
++    out->lsa_ok = 1;
+     return RAD_OK;
+ }
+ 
+diff --git a/docs/OPS.md b/docs/OPS.md
+index 62ebe78..e4be620 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -3279,9 +3279,10 @@ do not depend on the batch.
+ 
+ | op | params | operands |
+ |---|---|---|
+-| `lsa_index_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `rot` `dim` `block_size` | `q`, `k`, `map`, `slot`, `cache`:inout → `iq` |
++| `lsa_index_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `rot` `dim` `block_size` `map_kv`/opt `kv0`/opt `mode`/opt | `q`, `k`, `map`, `slot`, `cache`:inout → `iq`, `part`/opt:inout |
+ | `lsa_cluster` | `M`(range) `window` `pool` `bucket` `cap` `dim` `block_size` | `pos`, `cu`, `idx`, `idx_bt`, `bkt`:inout, `bkt_bt` |
+-| `lsa_select` | `M`(range) `window` `sink` `top_k` `top_p` `pool` `bucket` `cap` `dim` | `iq`, `pos`, `cu`, `bkt`, `bkt_bt`, `score`:inout → `sel`, `nsel` |
++| `lsa_select` | `M`(range) `window` `sink` `top_k` `top_p` `pool` `bucket` `cap` `dim` `row0`/opt | `iq`, `pos`, `cu`, `bkt`, `bkt_bt`, `score`:inout → `sel`, `nsel` |
++| `lsa_pages` | `M`(range) `block_size` `row0`/opt | `sel`, `nsel`, `cu`, `bt` → `psel`, `pnsel`, `sequ` |
+ 
+ D-LSA (latent sparse attention, Prefrontal-AI, arXiv 2610.42147) has a full-attention decode query
+ read its sinks, its window and the `top_k` keys of the `top_p` buckets its index query scores best,
+@@ -3312,6 +3313,13 @@ in order; the product is rounded to bf16 (the bf16 GEMM output the paper's plugi
+ normalized as `x / max(|x|, 1e-12)`. The key is stored at the row's `slot` in bf16, the query written
+ to `iq` in f32. A negative slot stores nothing.
+ 
++Under tensor parallelism a rank holds a run of the layer's KV heads (`n_head_kv` of them from `kv0`,
++the map holding all `map_kv`). `mode` 1 writes the rank's heads' sums, unrounded, to `part`
++(`[M, 2 * dim]` f32, the query side then the key side) and stores nothing; the caller all-reduces it;
++`mode` 2 rounds the reduced sums to bf16 and finishes as above. With one KV head a rank and two ranks
++the reduced sum is the one-rank sum to the bit (one f32 addition either way). Mode 0 (the default)
++needs `map_kv == n_head_kv`.
++
+ ### `lsa_cluster`
+ 
+ Every cluster block whose last key a sequence's rows wrote this step, clustered into its
+@@ -3344,6 +3352,22 @@ launch also counts the first digit across the device, which the pick would other
+ result is the same either way. On an R9700 one decode row takes ~100 us at 128k of context and
+ ~135 us at 512k, the flat design's budget.
+ 
++`row0` (default 0) is the launch's first row in the step: `iq`, `pos`, `score`, `sel` and `nsel` are
++then a chunk of the step's rows and only `cu` is read at `row0 + m`. A prefill selects its rows a chunk
++at a time so the score plane stays `[chunk, live]`. A row sees only the blocks closed before its own
++position, so a prefill row's read is causal however much of the step precedes it.
++
++### `lsa_pages`
++
++A paged attention reads pages, not positions. `lsa_pages` turns each row's ascending list into the
++page list such an attention takes (QSA's `sel`/`seqused` form): each distinct page `position /
++block_size` once, in order, as its id in the attention's block table (`bt`, the row's sequence from
++`cu` at `row0 + m`), `-1` padded; `pnsel` the count and `sequ` `(pnsel - 1) * block_size + last %
++block_size + 1`, so the last page ends at the row's own position. A page the list only cuts into (a
++sink page, the window's first, the expansion cut at `top_k`) is read whole: the read is a superset of
++the list by at most `block_size - 1` earlier keys a cut. With `pool` a multiple of `block_size` a
++bucket is whole pages, so only the sinks, the window's start and the last bucket cut.
++
+ ## Draft heads
+ 
+ A drafter is an ordinary graph over ordinary ops except at its two ends: what proposes the
+diff --git a/libr4d/r4d_lsa.hip b/libr4d/r4d_lsa.hip
+index 3899700..50f06f7 100644
+--- a/libr4d/r4d_lsa.hip
++++ b/libr4d/r4d_lsa.hip
+@@ -179,15 +179,20 @@ __global__ __launch_bounds__(kThreads) void lsa_index_store_kernel(
+     const uint16_t* __restrict__ q, long q_ld, const uint16_t* __restrict__ k, long k_ld,
+     const uint16_t* __restrict__ map, const int32_t* __restrict__ slot,
+     uint16_t* __restrict__ cache, long n_slots, float* __restrict__ iq, long iq_ld,
+-    int n_head, int n_kv, int head_dim, int rot) {
++    int n_head, int n_kv, int head_dim, int rot, int map_kv, int kv0, int mode,
++    float* __restrict__ psum, long psum_ld) {
+     __shared__ float x[2][kMaxKey];
+     __shared__ float part[2][kMaxKv][kDim];
+     __shared__ float y[2][kDim];
+     __shared__ float den[2];
+     const int r = (int)blockIdx.x, t = (int)threadIdx.x;
+     const int free = head_dim - rot, key_dim = n_kv * free, group = n_head / n_kv;
++    /* The map's rows: `map_kv` KV heads a side, this launch's from head `kv0` (tensor
++     * parallelism: a rank's heads are a run of the layer's). */
++    const long map_side = (long)map_kv * free * kDim;
+     const uint16_t* qr = q + (long)r * q_ld;
+     const uint16_t* kr = k + (long)r * k_ld;
++    if (mode == 2) goto finish;
+     for (int e = t; e < key_dim; e += kThreads) {
+         const int g = e / free, i = e % free;
+         float s = 0.0f;
+@@ -198,7 +203,7 @@ __global__ __launch_bounds__(kThreads) void lsa_index_store_kernel(
+     __syncthreads();
+     for (int e = t; e < 2 * n_kv * kDim; e += kThreads) {
+         const int side = e / (n_kv * kDim), h = (e / kDim) % n_kv, j = e % kDim;
+-        const uint16_t* w = map + (long)side * key_dim * kDim;
++        const uint16_t* w = map + (long)side * map_side + (long)kv0 * free * kDim;
+         /* One chain, its loads issued ahead of it: the map is read from L2 at decode, and a
+          * load a step would leave the chain waiting on each. */
+         const float* xs = &x[side][h * free];
+@@ -220,8 +225,14 @@ __global__ __launch_bounds__(kThreads) void lsa_index_store_kernel(
+         const int side = t / kDim, j = t % kDim;
+         float total = part[side][0][j];
+         for (int h = 1; h < n_kv; ++h) total += part[side][h][j];
+-        y[side][j] = bf16_to_f32(f32_to_bf16(total));
++        /* Partial: the rank's heads' sum, unrounded, for the all-reduce. Two ranks of one head
++         * each sum to the one rank's p0 + p1 exactly (one f32 addition either way). */
++        if (mode == 1) psum[(long)r * psum_ld + t] = total;
++        else           y[side][j] = bf16_to_f32(f32_to_bf16(total));
+     }
++    if (mode == 1) return;
++finish:
++    if (mode == 2 && t < 2 * kDim) y[t / kDim][t % kDim] = bf16_to_f32(f32_to_bf16(psum[(long)r * psum_ld + t]));
+     __syncthreads();
+     if (t < 2) {
+         const float n = sqrtf(lsa_dot(y[t], y[t]));
+@@ -440,13 +451,13 @@ __global__ __launch_bounds__(kThreads) void lsa_score_kernel(
+     const int32_t* __restrict__ cu, int n_seq, const uint8_t* __restrict__ bkt, long bkt_pages,
+     long page_bytes, const int32_t* __restrict__ bt, long bt_ld, long bt_cols,
+     float* __restrict__ score, long sc_ld, int live, int window, int nb,
+-    uint32_t* __restrict__ hist) {
++    uint32_t* __restrict__ hist, int row0) {
+     __shared__ float qv[kDim];
+     __shared__ int   info[2];
+     __shared__ uint32_t lh[kHist1];
+     const int m = (int)blockIdx.y, t = (int)threadIdx.x;
+     if (t == 0) {
+-        const int s = lsa_seq_of(cu, n_seq, m);
++        const int s = lsa_seq_of(cu, n_seq, m + row0);
+         info[0] = s;
+         info[1] = s < 0 ? 0 : lsa_visible(pos[m], window, nb, bt_cols, live);
+     }
+@@ -495,7 +506,7 @@ __global__ __launch_bounds__(kPick) void lsa_pick_kernel(
+     long page_bytes, const int32_t* __restrict__ bt, long bt_ld, long bt_cols,
+     int32_t* __restrict__ sel, long sel_ld, int sel_w, int32_t* __restrict__ nsel,
+     int window, int sink, int top_k, int top_p, int nb, int cap, int cand_n,
+-    const uint32_t* __restrict__ hist) {
++    const uint32_t* __restrict__ hist, int row0) {
+     R4D_DYN_LDS(uint64_t, dyn);
+     uint64_t* cand = dyn;                         /* [cand_n] candidates, then sorted */
+     int32_t*  cnt  = (int32_t*)(cand + cand_n);   /* [cand_n] keys each reads, then where they go */
+@@ -505,7 +516,7 @@ __global__ __launch_bounds__(kPick) void lsa_pick_kernel(
+     __shared__ int info[6];
+     const int m = (int)blockIdx.x, t = (int)threadIdx.x;
+     if (t == 0) {
+-        const int s = lsa_seq_of(cu, n_seq, m);
++        const int s = lsa_seq_of(cu, n_seq, m + row0);
+         info[0] = s;
+         info[1] = pos[m];
+         info[2] = s < 0 ? 0 : lsa_visible(pos[m], window, nb, bt_cols, live);
+@@ -666,6 +677,66 @@ __global__ __launch_bounds__(kPick) void lsa_pick_kernel(
+     if (t == 0) nsel[m] = total;
+ }
+ 
++// ============================================================== lsa_pages
++
++/* A workgroup a row: the row's ascending position list as the attention's page list. Each
++ * distinct page (position / block_size) is taken once, in order, as its id in the attention's
++ * block table; `sequ` is the tokens the list covers, every page whole but the last, which ends at
++ * the row's own position (the window's last key). The attention reads every key of a listed page,
++ * so a page the list only cuts into (a sink page, the window's first, the expansion cut at top_k)
++ * adds its other keys, all before the row: at most block_size - 1 a cut. */
++__global__ __launch_bounds__(kThreads) void lsa_pages_kernel(
++    const int32_t* __restrict__ sel, long sel_ld, int sel_w, const int32_t* __restrict__ nsel,
++    const int32_t* __restrict__ cu, int n_seq, int row0, const int32_t* __restrict__ bt,
++    long bt_ld, long bt_cols, int bs, int32_t* __restrict__ psel, long ps_ld, int pcap,
++    int32_t* __restrict__ pn, int32_t* __restrict__ sequ) {
++    __shared__ int sc[kThreads];
++    __shared__ int info[2];
++    const int m = (int)blockIdx.x, t = (int)threadIdx.x;
++    if (t == 0) {
++        const int s = lsa_seq_of(cu, n_seq, m + row0);
++        int n = nsel[m];
++        if (n > sel_w) n = sel_w;
++        info[0] = s;
++        info[1] = s < 0 || n < 0 ? 0 : n;
++    }
++    __syncthreads();
++    const int s = info[0], n = info[1];
++    const int32_t* sr = sel + (long)m * sel_ld;
++    int32_t* out = psel + (long)m * ps_ld;
++    int base = 0;
++    for (int c0 = 0; c0 < n; c0 += kThreads) {
++        const int i = c0 + t;
++        int blk = -1;
++        bool first = false;
++        if (i < n) {
++            const int p = sr[i];
++            blk = p >= 0 ? p / bs : -1;
++            const int pp = i > 0 ? sr[i - 1] : -1;
++            first = blk >= 0 && blk < bt_cols && (pp < 0 || pp / bs != blk);
++        }
++        sc[t] = first ? 1 : 0;
++        __syncthreads();
++        for (int o = 1; o < kThreads; o <<= 1) {
++            const int v = t >= o ? sc[t - o] : 0;
++            __syncthreads();
++            sc[t] += v;
++            __syncthreads();
++        }
++        const int at = base + sc[t] - 1;
++        if (first && at < pcap) out[at] = bt[(long)s * bt_ld + blk];
++        base += sc[kThreads - 1];
++        __syncthreads();
++    }
++    const int cnt = base < pcap ? base : pcap;
++    for (int i = cnt + t; i < pcap; i += kThreads) out[i] = -1;
++    if (t == 0) {
++        pn[m] = cnt;
++        const int last = n > 0 ? sr[n - 1] : -1;
++        sequ[m] = cnt > 0 && last >= 0 ? (cnt - 1) * bs + last % bs + 1 : 0;
++    }
++}
++
+ // ============================================================== plugin ABI entry points
+ 
+ bool lsa_is_table(const RadTensor* t) {
+@@ -714,16 +785,23 @@ static inline size_t lsa_pick_lds(long long top_p, long long top_k) {
+     return (size_t)lsa_pow2((int)top_p) * 12 + (size_t)lsa_pow2((int)top_k) * 4;
+ }
+ 
+-enum { LI_Q = 0, LI_K = 1, LI_MAP = 2, LI_SLOT = 3, LI_CACHE = 4, LI_IQ = 5 };
++enum { LI_Q = 0, LI_K = 1, LI_MAP = 2, LI_SLOT = 3, LI_CACHE = 4, LI_IQ = 5, LI_PART = 6 };
+ 
+ extern "C" int r4d_rad_lsa_index_store(const RadArgs* a, RadStream stream) {
+     const RadTensor *q = r4d_opt(a, LI_Q), *k = r4d_opt(a, LI_K), *mp = r4d_opt(a, LI_MAP);
+     const RadTensor *sl = r4d_opt(a, LI_SLOT), *ca = r4d_opt(a, LI_CACHE), *iq = r4d_opt(a, LI_IQ);
+     const long long hd = r4d_geti_or(a, "head_dim", 0), nh = r4d_geti_or(a, "n_head", 0);
+     const long long nkv = r4d_geti_or(a, "n_head_kv", 0), rot = r4d_geti_or(a, "rot", 0);
++    /* Tensor parallelism: the map's KV heads (all of the layer's), the first of this launch's,
++     * and the mode: 0 the whole row, 1 the partial sums into `part` (all-reduced by the caller),
++     * 2 the row finished from the reduced `part`. */
++    const long long map_kv = r4d_geti_or(a, "map_kv", nkv), kv0 = r4d_geti_or(a, "kv0", 0);
++    const long long mode = r4d_geti_or(a, "mode", 0);
++    const RadTensor* pa = r4d_opt(a, LI_PART);
+     if (r4d_geti_or(a, "dim", 0) != kDim) return R4D_NO(RAD_E_SHAPE);
+     if (hd < 1 || rot < 0 || rot >= hd || nkv < 1 || nkv > kMaxKv || nh < nkv || nh % nkv ||
+-        nkv * (hd - rot) > kMaxKey)
++        nkv * (hd - rot) > kMaxKey || map_kv < nkv || kv0 < 0 || kv0 + nkv > map_kv ||
++        mode < 0 || mode > 2 || (mode == 0 && map_kv != nkv))
+         return R4D_NO(RAD_E_SHAPE);
+     if (!q || !k || !mp || !q->data || !k->data || !mp->data) return R4D_NO(RAD_E_INVAL);
+     if (q->dtype != RAD_BF16 || k->dtype != RAD_BF16 || mp->dtype != RAD_BF16)
+@@ -731,13 +809,17 @@ extern "C" int r4d_rad_lsa_index_store(const RadArgs* a, RadStream stream) {
+     if (q->rank != 2 || k->rank != 2 || q->shape[0] != k->shape[0] || q->shape[1] < nh * hd ||
+         k->shape[1] < nkv * hd || q->stride[1] != 1 || k->stride[1] != 1)
+         return R4D_NO(RAD_E_SHAPE);
+-    const long long T = q->shape[0], key_dim = nkv * (hd - rot);
++    const long long T = q->shape[0], key_dim = map_kv * (hd - rot);
+     if (r4d_numel(mp) != 2 * key_dim * kDim || !r4d_contig(mp)) return R4D_NO(RAD_E_SHAPE);
+-    /* The store is optional (a query-only call), the query too; not both absent. */
+-    const bool store = ca && ca->data;
+-    if (!store && !(iq && iq->data)) return R4D_NO(RAD_E_INVAL);
++    if (mode != 0 && (!pa || !pa->data || pa->dtype != RAD_F32 || pa->rank != 2 ||
++                      pa->shape[0] < T || pa->shape[1] != 2 * kDim || pa->stride[1] != 1))
++        return R4D_NO(RAD_E_SHAPE);
++    /* The store is optional (a query-only call), the query too; not both absent. A partial call
++     * writes neither. */
++    const bool store = mode != 1 && ca && ca->data;
++    if (mode != 1 && !store && !(iq && iq->data)) return R4D_NO(RAD_E_INVAL);
+     if (store && (!lsa_is_idx(ca) || !lsa_is_vec(sl, T))) return R4D_NO(RAD_E_SHAPE);
+-    if (iq && iq->data &&
++    if (mode != 1 && iq && iq->data &&
+         (iq->dtype != RAD_F32 || iq->rank != 2 || iq->shape[0] < T || iq->shape[1] != kDim ||
+          iq->stride[1] != 1))
+         return R4D_NO(RAD_E_SHAPE);
+@@ -749,9 +831,10 @@ extern "C" int r4d_rad_lsa_index_store(const RadArgs* a, RadStream stream) {
+                     store ? (const int32_t*)sl->data : nullptr,
+                     store ? (uint16_t*)ca->data : nullptr,
+                     store ? (long)(ca->shape[0] * ca->shape[2]) : 0L,
+-                    iq && iq->data ? (float*)iq->data : nullptr,
+-                    iq && iq->data ? (long)iq->stride[0] : 0L, (int)nh, (int)nkv, (int)hd,
+-                    (int)rot);
++                    mode != 1 && iq && iq->data ? (float*)iq->data : nullptr,
++                    mode != 1 && iq && iq->data ? (long)iq->stride[0] : 0L, (int)nh, (int)nkv,
++                    (int)hd, (int)rot, (int)map_kv, (int)kv0, (int)mode,
++                    mode != 0 ? (float*)pa->data : nullptr, mode != 0 ? (long)pa->stride[0] : 0L);
+ }
+ 
+ enum { LC_POS = 0, LC_CU = 1, LC_IDX = 2, LC_IDX_BT = 3, LC_BKT = 4, LC_BKT_BT = 5 };
+@@ -800,7 +883,10 @@ extern "C" int r4d_rad_lsa_select(const RadArgs* a, RadStream stream) {
+         return R4D_NO(RAD_E_INVAL);
+     if (iq->dtype != RAD_F32 || sc->dtype != RAD_F32 || se->dtype != RAD_I32)
+         return R4D_NO(RAD_E_DTYPE);
+-    const long long M = iq->shape[0], n_seq = cu->shape[0] - 1;
++    /* `row0`: the launch's first row in the step, for a step's rows selected a chunk at a time.
++     * iq, pos, score, sel and nsel are the chunk's; cu is the step's, read at row0 + m. */
++    const long long M = iq->shape[0], n_seq = cu->shape[0] - 1, row0 = r4d_geti_or(a, "row0", 0);
++    if (row0 < 0 || row0 > INT_MAX - 65535) return R4D_NO(RAD_E_SHAPE);
+     if (iq->rank != 2 || iq->shape[1] != kDim || iq->stride[1] != 1 || !lsa_is_vec(po, M) ||
+         !lsa_is_bkt(bk, z.window, z.page_bytes()) || !lsa_is_table(bt) || bt->shape[0] < n_seq ||
+         sc->rank != 2 || sc->shape[0] < M || sc->stride[1] != 1 || se->rank != 2 ||
+@@ -828,7 +914,8 @@ extern "C" int r4d_rad_lsa_select(const RadArgs* a, RadStream stream) {
+                                 (const uint8_t*)bk->data, (long)bk->shape[0],
+                                 (long)z.page_bytes(), (const int32_t*)bt->data,
+                                 (long)bt->stride[0], (long)bt->shape[1], (float*)sc->data,
+-                                (long)sc->stride[0], (int)live, (int)z.window, (int)z.nb(), hist);
++                                (long)sc->stride[0], (int)live, (int)z.window, (int)z.nb(), hist,
++                                (int)row0);
+         if (rc != RAD_OK) return rc;
+     }
+     const int cand_n = lsa_pow2((int)z.top_p);
+@@ -840,7 +927,7 @@ extern "C" int r4d_rad_lsa_select(const RadArgs* a, RadStream stream) {
+                     (long)bt->stride[0], (long)bt->shape[1], (int32_t*)se->data,
+                     (long)se->stride[0], (int)se->shape[1], (int32_t*)ns->data, (int)z.window,
+                     (int)z.sink, (int)z.top_k, (int)z.top_p, (int)z.nb(), (int)z.cap, cand_n,
+-                    (const uint32_t*)hist);
++                    (const uint32_t*)hist, (int)row0);
+ }
+ 
+ /* The first digit's counts for every row the band may carry: [M][2048] u32, 8 KiB a row. A
+@@ -849,3 +936,30 @@ extern "C" int64_t r4d_rad_lsa_select_scratch(const RadArgs* a) {
+     const long long M = r4d_geti_or(a, "M", 0);
+     return M > 0 ? (int64_t)M * kHist1 * 4 : 0;
+ }
++
++enum { LP_SEL = 0, LP_NSEL = 1, LP_CU = 2, LP_BT = 3, LP_PSEL = 4, LP_PN = 5, LP_SEQU = 6 };
++
++/* The rows' position lists as attention page lists (lsa_pages_kernel). `row0` as lsa_select's. */
++extern "C" int r4d_rad_lsa_pages(const RadArgs* a, RadStream stream) {
++    const long long bs = r4d_geti_or(a, "block_size", 0), row0 = r4d_geti_or(a, "row0", 0);
++    const RadTensor *se = r4d_opt(a, LP_SEL), *ns = r4d_opt(a, LP_NSEL), *cu = r4d_opt(a, LP_CU);
++    const RadTensor *bt = r4d_opt(a, LP_BT), *ps = r4d_opt(a, LP_PSEL), *pn = r4d_opt(a, LP_PN);
++    const RadTensor *sq = r4d_opt(a, LP_SEQU);
++    if (bs < 1 || row0 < 0 || row0 > INT_MAX - 65535) return R4D_NO(RAD_E_SHAPE);
++    if (!se || !se->data || !cu || !cu->data || !ps || !ps->data) return R4D_NO(RAD_E_INVAL);
++    if (se->dtype != RAD_I32 || cu->dtype != RAD_I32 || ps->dtype != RAD_I32)
++        return R4D_NO(RAD_E_DTYPE);
++    const long long M = se->shape[0], n_seq = cu->shape[0] - 1;
++    if (se->rank != 2 || se->stride[1] != 1 || cu->rank != 1 || n_seq < 1 || !lsa_is_vec(ns, M) ||
++        !lsa_is_table(bt) || bt->shape[0] < n_seq || ps->rank != 2 || ps->shape[0] < M ||
++        ps->stride[1] != 1 || ps->shape[1] < 1 || !lsa_is_vec(pn, M) || !lsa_is_vec(sq, M))
++        return R4D_NO(RAD_E_SHAPE);
++    if (M < 1) return RAD_OK;
++    if (M > INT_MAX || ps->shape[1] > INT_MAX || se->shape[1] > INT_MAX) return R4D_NO(RAD_E_SHAPE);
++    return R4D_EMIT(stream, lsa_pages_kernel, dim3((unsigned)M), dim3(kThreads), 0,
++                    (const int32_t*)se->data, (long)se->stride[0], (int)se->shape[1],
++                    (const int32_t*)ns->data, (const int32_t*)cu->data, (int)n_seq, (int)row0,
++                    (const int32_t*)bt->data, (long)bt->stride[0], (long)bt->shape[1], (int)bs,
++                    (int32_t*)ps->data, (long)ps->stride[0], (int)ps->shape[1],
++                    (int32_t*)pn->data, (int32_t*)sq->data);
++}
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index bd63140..adaa28f 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -631,6 +631,7 @@ int r4d_rad_lsa_index_store (const RadArgs*, RadStream);
+ int r4d_rad_lsa_cluster     (const RadArgs*, RadStream);
+ int r4d_rad_lsa_select      (const RadArgs*, RadStream);
+ int64_t r4d_rad_lsa_select_scratch(const RadArgs*);
++int r4d_rad_lsa_pages       (const RadArgs*, RadStream);
+ int r4d_rad_kv_resolve      (const RadArgs*, RadStream);
+ int64_t r4d_rad_kv_resolve_scratch(const RadArgs*);
+ int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index 275f394..7006e90 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -1453,6 +1453,12 @@ static const RadParamSpec pLsaIndexStore[] = {
+     { "rot",        RAD_P_INT, RAD_REQUIRED },   /* the rotated prefix of a head */
+     { "dim",        RAD_P_INT, RAD_REQUIRED },   /* index dims */
+     { "block_size", RAD_P_INT, RAD_REQUIRED },
++    /* Tensor parallelism: the map's KV heads (default n_head_kv), the first of this launch's
++     * (default 0), and the mode: 0 whole rows, 1 the heads' partial sums into `part` for an
++     * all-reduce, 2 the rows finished from the reduced `part`. */
++    { "map_kv",     RAD_P_INT, RAD_OPTIONAL },
++    { "kv0",        RAD_P_INT, RAD_OPTIONAL },
++    { "mode",       RAD_P_INT, RAD_OPTIONAL },
+ };
+ static const RadOperandSpec oLsaIndexStore[] = {
+     { "q",     RAD_OPD_IN,    0 },   /* [M, n_head * head_dim] bf16, normed and rotated */
+@@ -1461,8 +1467,10 @@ static const RadOperandSpec oLsaIndexStore[] = {
+      * engine uploaded (RadBuildCtx::lsa), not a weight: it is no part of the container. */
+     { "map",   RAD_OPD_IN,    0 },
+     { "slot",  RAD_OPD_IN,    0 },   /* [M] the kv_lsa_idx slot mapping */
+-    { "cache", RAD_OPD_INOUT, 0 },   /* kv_lsa_idx, this layer */
+-    { "iq",    RAD_OPD_OUT,   0 },   /* [M, dim] f32 index queries */
++    /* Either may be absent, not both, except at mode 1, which writes neither. */
++    { "cache", RAD_OPD_INOUT, 1 },   /* kv_lsa_idx, this layer */
++    { "iq",    RAD_OPD_OUT,   1 },   /* [M, dim] f32 index queries */
++    { "part",  RAD_OPD_INOUT, 1 },   /* [M, 2 * dim] f32: mode 1 writes it, mode 2 reads it */
+ };
+ static const RadParamSpec pLsaCluster[] = {
+     { "M",          RAD_P_INT, RAD_REQUIRED },
+@@ -1493,6 +1501,9 @@ static const RadParamSpec pLsaSelect[] = {
+     { "bucket", RAD_P_INT, RAD_REQUIRED },
+     { "cap",    RAD_P_INT, RAD_REQUIRED },
+     { "dim",    RAD_P_INT, RAD_REQUIRED },
++    /* the launch's first row in the step: iq, pos, score, sel and nsel are a chunk of the step's
++     * rows, cu the whole step's */
++    { "row0",   RAD_P_INT, RAD_OPTIONAL },
+ };
+ static const RadOperandSpec oLsaSelect[] = {
+     { "iq",    RAD_OPD_IN,    0 },   /* [M, dim] f32 */
+@@ -1506,6 +1517,20 @@ static const RadOperandSpec oLsaSelect[] = {
+     { "sel",   RAD_OPD_OUT,   0 },   /* [M, >= sink + top_k + window] i32 positions, -1 padded */
+     { "nsel",  RAD_OPD_OUT,   0 },   /* [M] i32 */
+ };
++static const RadParamSpec pLsaPages[] = {
++    { "M",          RAD_P_INT, RAD_REQUIRED },
++    { "block_size", RAD_P_INT, RAD_REQUIRED },   /* the attention cache's */
++    { "row0",       RAD_P_INT, RAD_OPTIONAL },   /* as lsa_select's */
++};
++static const RadOperandSpec oLsaPages[] = {
++    { "sel",  RAD_OPD_IN,  0 },   /* [M, width] i32 ascending positions, lsa_select's */
++    { "nsel", RAD_OPD_IN,  0 },   /* [M] */
++    { "cu",   RAD_OPD_IN,  0 },   /* [n_seq + 1], the step's */
++    { "bt",   RAD_OPD_IN,  0 },   /* the attention's block table */
++    { "psel", RAD_OPD_OUT, 0 },   /* [M, P] i32 page ids, -1 padded */
++    { "pnsel", RAD_OPD_OUT, 0 },  /* [M] pages */
++    { "sequ", RAD_OPD_OUT, 0 },   /* [M] tokens the pages cover */
++};
+ 
+ /* `rmsnorm_quant_fp8` and `gated_quant_fp8`, new ops whose schemas this plugin fixes. Each is its
+  * producer's operand list with the quantiser's two outputs added and the producer's bf16 output
+@@ -3696,7 +3721,14 @@ static const RadOpSchema kSchemas[] = {
+            "score to the lower bucket), their members past the sinks and before the window read "
+            "in that order until TOP_K are held (the last bucket cut short). `sel` is the sinks, "
+            "those keys and the window [pos + 1 - window, pos] as ONE ASCENDING LIST of positions, "
+-           "-1 padded, `nsel` its length; the attention maps a position to its page itself."),
++           "-1 padded, `nsel` its length; the attention maps a position to its page itself. "
++           "`row0` offsets the rows into `cu` only, for a step selected a chunk at a time."),
++    SCHEMA("lsa_pages", pLsaPages, oLsaPages,
++           "each row's ascending position list as the attention's page list: every distinct "
++           "page (position / block_size) once, in order, as its block-table id; `pn` the count, "
++           "`sequ` (pn - 1) * block_size + last % block_size + 1, so the last page ends at the "
++           "row's own position. Pages the list only cuts into are read whole: a superset of the "
++           "list by at most block_size - 1 earlier keys a cut."),
+     SCHEMA("qsa_block_key", pQsaBlockKey, oQsaBlockKey,
+            "the QSA indexer's compressed key: out[b] = rope(rmsnorm(mean of the `ratio` raw keys "
+            "of block b), at the position of the block's FIRST token). The mean is accumulated in "
+@@ -5066,6 +5098,9 @@ static const RadConstraint cLsaSelect[] = {
+     C_GE("top_p", 1), C_LE("top_p", 2048), C_GE("top_k", 1), C_LE("top_k", 8192),
+     C_GE("M", 1), C_LE("M", 65535),
+ };
++static const RadConstraint cLsaPages[] = {
++    C_GE("block_size", 1), C_GE("M", 1),
++};
+ 
+ /* The head dim is bounded by the LDS row the block reduction needs, and the rotary width by the
+  * neox pairing (`rot/2` apart, so even and inside the head). The bounds are the kernel's. */
+@@ -8966,6 +9001,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
+   ROW(cLsaSelect), NOTUNE,
+   nullptr, nullptr, r4d_rad_lsa_select, r4d_rad_lsa_select_scratch, nullptr, nullptr, nullptr },
+ 
++{ "lsa_pages_i32", "lsa_pages", "attn",
++  "D-LSA position lists to the attention's page lists, a workgroup a row",
++  "any block size, any list width",
++  "i32 position lists, lengths, cu_seqlens and a block table; i32 page lists, counts, tokens",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cLsaPages), NOTUNE,
++  nullptr, nullptr, r4d_rad_lsa_pages, nullptr, nullptr, nullptr, nullptr },
++
+ /* The only query-independent piece of QSA, hence a kernel of its own: a block key is fixed once
+  * its tokens exist, so it is built when the last arrives and read by every later query. */
+ { "qsa_block_key_bf16", "qsa_block_key", "attn",
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index 4da322f..bc3c30c 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -369,10 +369,18 @@ TEST(qwen35_bf16_lsa_declares_the_index_side) {
+     RadBuilder bad;
+     CHECK_EQ(stderr_of_rc([&] { return qwen35_bf16::declare(&bad, &meta, &ctx); }), RAD_E_SHAPE);
+     lm.key_dim = 768;
++    /* Two ranks over two KV heads, one each: a partial store, an exact f32 all-reduce of its
++     * sums and the finishing store a layer. */
+     RadBuildCtx two = build_ctx(0, 2);
+     two.lsa = &lm;
+     RadBuilder tp;
+-    CHECK_EQ(stderr_of_rc([&] { return qwen35_bf16::declare(&tp, &meta, &two); }), RAD_E_UNSUPPORTED);
++    CHECK_OK(qwen35_bf16::declare(&tp, &meta, &two));
++    CHECK_EQ(count_op(tp, "lsa_index_store"), 4);
++    /* Eight ranks replicate the four KV heads: refused. */
++    RadBuildCtx four = build_ctx(0, 8);
++    four.lsa = &lm;
++    RadBuilder tp4;
++    CHECK_EQ(stderr_of_rc([&] { return qwen35_bf16::declare(&tp4, &meta, &four); }), RAD_E_UNSUPPORTED);
+ }
+ 
+ TEST(qwen35_bf16_yarn_reaches_every_text_rotary_op) {
+@@ -2008,6 +2016,78 @@ TEST(qwen4exp_yarn_reaches_attention_indexer_and_compressed_keys) {
+     CHECK(direct > 0); CHECK(table > 0); CHECK(compressed > 0);
+ }
+ 
++/* --lsa on Flash-Next: the full-attention layers take D-LSA in place of the QSA indexer, every
++ * row of a sparse step (prefill too) selected and paged before the attention, which reads the
++ * page lists through QSA's sparse path; at two ranks the index sums are all-reduced. */
++TEST(qwen4exp_lsa_replaces_the_qsa_indexer_at_prefill_and_decode) {
++    RadModelMeta meta = qwen4exp_meta();
++    std::vector<uint16_t> maps(2 * 2 * 384 * 64);
++    std::vector<int32_t> mol(8, -1);
++    mol[3] = 0;
++    mol[7] = 1;
++    RadLsaMap lm{};
++    lm.maps = maps.data(); lm.map_of_layer = mol.data(); lm.n_layers = 8; lm.n_maps = 2;
++    lm.key_dim = 384; lm.index_dim = 64; lm.window = 512; lm.sink = 4; lm.top_k = 4096;
++    lm.top_p = 1024; lm.pool = 4; lm.bucket = 8; lm.bucket_cap = 16;
++    for (int world : { 1, 2 }) {
++        RadBuildCtx c = build_ctx(0, world);
++        c.max_tok = 512; c.max_seqs = 1; c.max_spec = 0; c.max_ctx = 200000;
++        c.lsa = &lm;
++        RadBuilder b;
++        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
++        CHECK_EQ(count_op(b, "qsa_select"), 0);
++        CHECK_EQ(count_op(b, "lsa_cluster"), 2);
++        CHECK_EQ(count_op(b, "lsa_index_store"), world == 1 ? 2 : 4);
++        CHECK_EQ(count_op(b, "lsa_select"), 2 * 4);   /* four 128-row chunks a layer */
++        CHECK_EQ(count_op(b, "lsa_pages"), 2 * 4);
++        CHECK(find_b(b, "qsa_score") == nullptr);
++        for (const bool dense : { true, false }) {
++            auto k = kit(b, {}, { 300 }, dense ? 100 : 9000);
++            RadCtx ctx;
++            ctx.b = &b;
++            ctx.batch = &k->b;
++            qwen4exp_fp8::step(&ctx, &k->b);
++            CHECK_LINT(b, &ctx);
++            std::vector<std::string> ops = issued_ops(b, ctx);
++            CHECK_EQ(std::count(ops.begin(), ops.end(), "lsa_cluster"), 2);
++            /* Every one of the 300 rows selected and paged once a layer, in chunks of at most
++             * 128 (a pipelined prefill selects each piece's rows on its own). */
++            int64_t sel_rows = 0, page_rows = 0;
++            for (const RecIssue& is : ctx.issues) {
++                const RecOp* o = b.op_of(is.op);
++                if (!o) continue;
++                if (o->op == "lsa_select") { sel_rows += is.n; CHECK(is.n <= 128); }
++                if (o->op == "lsa_pages") page_rows += is.n;
++            }
++            CHECK_EQ(sel_rows, dense ? 0 : 2 * 300);
++            CHECK_EQ(page_rows, dense ? 0 : 2 * 300);
++            if (!dense) {
++                const auto at = [&](const char* op) { return std::find(ops.begin(), ops.end(), op) - ops.begin(); };
++                CHECK(at("lsa_index_store") < at("lsa_cluster"));
++                CHECK(at("lsa_cluster") < at("lsa_select"));
++                CHECK(at("lsa_select") < at("lsa_pages"));
++            }
++        }
++        {   /* a sizing declare at a smaller max_tok declares the same ops in the same order */
++            RadBuildCtx cs = c;
++            cs.max_tok = 64;
++            cs.shape_probe = 1;
++            RadBuilder bs;
++            REQUIRE_EQ(qwen4exp_fp8::declare(&bs, &meta, &cs), RAD_OK);
++            REQUIRE_EQ(bs.ops.size(), b.ops.size());
++            bool same = true;
++            for (size_t i = 0; i < b.ops.size(); ++i)
++            {
++                same = same && bs.ops[i].op == b.ops[i].op;
++                for (const RecParam& x : b.ops[i].p)
++                    for (const RecParam& y : bs.ops[i].p)
++                        if (x.key == "row0" && y.key == "row0") same = same && x.ival == y.ival;
++            }
++            CHECK(same);
++        }
++    }
++}
++
+ /* A streamed attention group's selection must be made resident and rewritten between
+  * `qsa_select` and the sparse attention, and the layer's KV store must come first: a block this
+  * step writes may not be in the ring, and the resolve copies such a block whole out of the host
+diff --git a/tests/lsa_cases.h b/tests/lsa_cases.h
+index 42739cf..868c445 100644
+--- a/tests/lsa_cases.h
++++ b/tests/lsa_cases.h
+@@ -143,6 +143,122 @@ inline void index_store(const Backend& run, Tally& tl, int64_t T, int64_t n_head
+     tl.check(std::memcmp(iq.data(), want_iq.data(), iq.size() * 4) == 0, std::string(what) + ": the index queries");
+ }
+ 
++/* Tensor parallelism: the layer's KV heads split over `world` ranks, each rank's heads' partial
++ * sums (mode 1) all-reduced on the host in rank order and finished (mode 2), against the whole
++ * row (mode 0). One KV head a rank sums as the one-rank kernel does, so the match is to the bit. */
++inline void index_store_split(const Backend& run, Tally& tl, int64_t T, int64_t n_head, int64_t n_kv,
++                              int64_t hd, int64_t rot, int64_t world, uint64_t seed) {
++    std::mt19937_64 rng(seed);
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++    const int64_t D = 64, free = hd - rot, key_dim = n_kv * free, blocks = (T + 15) / 16 + 1;
++    const int64_t hq = n_head / world, hk = n_kv / world;
++    std::vector<uint16_t> q((size_t)(T * n_head * hd)), k((size_t)(T * n_kv * hd)), map((size_t)(2 * key_dim * D));
++    for (auto& x : q) x = bf(nd(rng));
++    for (auto& x : k) x = bf(nd(rng));
++    for (auto& x : map) x = bf(0.05f * nd(rng));
++    std::vector<int32_t> slot((size_t)T);
++    for (int64_t r = 0; r < T; ++r) slot[(size_t)r] = r % 5 == 2 ? -1 : (int32_t)(blocks * 16 - 1 - r);
++    const std::vector<RadParam> base = { pint("head_dim", hd), pint("n_head", n_head), pint("n_head_kv", n_kv),
++                                         pint("rot", rot), pint("dim", D), pint("block_size", 16) };
++    std::vector<uint16_t> cache0((size_t)(blocks * 16 * D), 0x7fc1);
++    std::vector<float> iq0((size_t)(T * D), -7.0f);
++    {
++        std::vector<Opd> t = { opd(q, RAD_BF16, { T, n_head * hd }), opd(k, RAD_BF16, { T, n_kv * hd }),
++                               opd(map, RAD_BF16, { 2 * key_dim, D }), opd(slot, RAD_I32, { T }),
++                               opd(cache0, RAD_BF16, { blocks, 1, 16, D }), opd(iq0, RAD_F32, { T, D }) };
++        tl.check(run("r4d_rad_lsa_index_store", t, base, false) == RAD_OK, "lsa_index_store split: the whole row");
++    }
++    std::vector<float> sum((size_t)(T * 128), 0.0f);
++    std::vector<std::vector<uint16_t>> rq((size_t)world), rk((size_t)world);
++    bool ok = true;
++    for (int64_t w = 0; w < world; ++w) {
++        auto& qr = rq[(size_t)w];
++        auto& kr = rk[(size_t)w];
++        for (int64_t r = 0; r < T; ++r) {
++            qr.insert(qr.end(), q.begin() + r * n_head * hd + w * hq * hd, q.begin() + r * n_head * hd + (w + 1) * hq * hd);
++            kr.insert(kr.end(), k.begin() + r * n_kv * hd + w * hk * hd, k.begin() + r * n_kv * hd + (w + 1) * hk * hd);
++        }
++        std::vector<float> part((size_t)(T * 128), 3.0f);
++        std::vector<uint16_t> cache((size_t)(blocks * 16 * D), 0x7fc1), cwant = cache;
++        std::vector<float> iq((size_t)(T * D), -7.0f);
++        std::vector<Opd> t = { opd(qr, RAD_BF16, { T, hq * hd }), opd(kr, RAD_BF16, { T, hk * hd }),
++                               opd(map, RAD_BF16, { 2 * key_dim, D }), opd(slot, RAD_I32, { T }),
++                               opd(cache, RAD_BF16, { blocks, 1, 16, D }), opd(iq, RAD_F32, { T, D }),
++                               opd(part, RAD_F32, { T, 128 }) };
++        std::vector<RadParam> p = { pint("head_dim", hd), pint("n_head", hq), pint("n_head_kv", hk),
++                                    pint("rot", rot), pint("dim", D), pint("block_size", 16),
++                                    pint("map_kv", n_kv), pint("kv0", w * hk), pint("mode", 1) };
++        ok = ok && run("r4d_rad_lsa_index_store", t, p, false) == RAD_OK && cache == cwant;
++        for (size_t i = 0; i < sum.size(); ++i) sum[i] += part[i];
++    }
++    tl.check(ok, "lsa_index_store split: the partial launches, which store nothing");
++    for (int64_t w = 0; w < world; ++w) {
++        std::vector<float> part = sum;
++        std::vector<uint16_t> cache((size_t)(blocks * 16 * D), 0x7fc1);
++        std::vector<float> iq((size_t)(T * D), -7.0f);
++        std::vector<Opd> t = { opd(rq[(size_t)w], RAD_BF16, { T, hq * hd }), opd(rk[(size_t)w], RAD_BF16, { T, hk * hd }),
++                               opd(map, RAD_BF16, { 2 * key_dim, D }), opd(slot, RAD_I32, { T }),
++                               opd(cache, RAD_BF16, { blocks, 1, 16, D }), opd(iq, RAD_F32, { T, D }),
++                               opd(part, RAD_F32, { T, 128 }) };
++        std::vector<RadParam> p = { pint("head_dim", hd), pint("n_head", hq), pint("n_head_kv", hk),
++                                    pint("rot", rot), pint("dim", D), pint("block_size", 16),
++                                    pint("map_kv", n_kv), pint("kv0", w * hk), pint("mode", 2) };
++        const int rc = run("r4d_rad_lsa_index_store", t, p, false);
++        char what[160];
++        std::snprintf(what, sizeof what, "lsa_index_store split T=%lld heads %lld/%lld over %lld ranks, rank %lld",
++                      (long long)T, (long long)n_head, (long long)n_kv, (long long)world, (long long)w);
++        tl.check(rc == RAD_OK, std::string(what) + ": status");
++        tl.check(cache == cache0, std::string(what) + ": the stored index keys, as one rank's");
++        tl.check(std::memcmp(iq.data(), iq0.data(), iq.size() * 4) == 0,
++                 std::string(what) + ": the index queries, as one rank's");
++    }
++}
++
++/* ================================================================== lsa_pages */
++/* Ascending position lists, as lsa_select writes them, over scrambled pages of `bs`. */
++inline void pages(const Backend& run, Tally& tl, int64_t bs, int64_t row0, uint64_t seed) {
++    std::mt19937_64 rng(seed);
++    const int64_t n_seq = 3, cols = 200, W = 97, P = 40, M = 9;
++    std::vector<int32_t> ids((size_t)(n_seq * cols));
++    std::iota(ids.begin(), ids.end(), 0);
++    std::shuffle(ids.begin(), ids.end(), rng);
++    std::vector<int32_t> bt = ids;
++    /* The chunk's M rows are rows [row0, row0 + M) of a step whose sequences split them. */
++    std::vector<int32_t> cu = { 0, (int32_t)(row0 + 3), (int32_t)(row0 + 5), (int32_t)(row0 + M) };
++    std::vector<int32_t> sel((size_t)(M * W), -1), nsel((size_t)M);
++    for (int64_t m = 0; m < M; ++m) {
++        const int64_t pos = 50 + (int64_t)(rng() % (uint64_t)(cols * bs - 60));
++        std::vector<int32_t> l;
++        for (int64_t p = 0; p <= pos && (int64_t)l.size() < W; ++p)
++            if (p < 3 || p > pos - 13 || rng() % 9 == 0) l.push_back((int32_t)p);
++        if (m == 4) l.clear();
++        if (l.empty() || l.back() != pos) { if (!l.empty() && (int64_t)l.size() == W) l.pop_back(); if (m != 4) l.push_back((int32_t)pos); }
++        std::copy(l.begin(), l.end(), sel.begin() + m * W);
++        nsel[(size_t)m] = (int32_t)l.size();
++    }
++    std::vector<int32_t> psel((size_t)(M * P), 0x55555555), pn((size_t)M, -9), sequ((size_t)M, -9);
++    std::vector<int32_t> want((size_t)(M * P), -1), want_n((size_t)M), want_u((size_t)M);
++    for (int64_t m = 0; m < M; ++m) {
++        const int64_t s = m + row0 < cu[1] ? 0 : m + row0 < cu[2] ? 1 : 2;
++        int64_t c = 0, last_blk = -1;
++        for (int64_t i = 0; i < nsel[(size_t)m]; ++i) {
++            const int64_t blk = sel[(size_t)(m * W + i)] / bs;
++            if (blk != last_blk && c < P) want[(size_t)(m * P + c++)] = bt[(size_t)(s * cols + blk)];
++            last_blk = blk;
++        }
++        want_n[(size_t)m] = (int32_t)c;
++        want_u[(size_t)m] = c ? (int32_t)((c - 1) * bs + sel[(size_t)(m * W + nsel[(size_t)m] - 1)] % bs + 1) : 0;
++    }
++    std::vector<Opd> t = { opd(sel, RAD_I32, { M, W }), opd(nsel, RAD_I32, { M }), opd(cu, RAD_I32, { n_seq + 1 }),
++                           opd(bt, RAD_I32, { n_seq, cols }), opd(psel, RAD_I32, { M, P }),
++                           opd(pn, RAD_I32, { M }), opd(sequ, RAD_I32, { M }) };
++    const int rc = run("r4d_rad_lsa_pages", t, { pint("M", M), pint("block_size", bs), pint("row0", row0) }, false);
++    char what[120];
++    std::snprintf(what, sizeof what, "lsa_pages block %lld, row0 %lld", (long long)bs, (long long)row0);
++    tl.check(rc == RAD_OK, std::string(what) + ": status");
++    tl.check(psel == want && pn == want_n && sequ == want_u, std::string(what) + ": the page lists, counts and tokens");
++}
++
+ /* ================================================================== pools and tables */
+ /* A paged group over `n_seq` sequences of `ctx` tokens at `block` a page, the pages scrambled. */
+ struct Paged {
+@@ -214,7 +330,7 @@ inline void cluster(const Backend& run, Tally& tl, const rad_lsa::Geom& g,
+  * one centroid, for ties. */
+ inline void select(const Backend& run, Tally& tl, const rad_lsa::Geom& g, int64_t n_seq, int64_t ctx,
+                    const std::vector<std::pair<int64_t, int64_t>>& rows, int64_t dup, uint64_t seed,
+-                   bool scratch) {
++                   bool scratch, int64_t chunk = 0) {
+     std::mt19937_64 rng(seed);
+     const int64_t D = g.dim, PB = g.page_bytes(), NB = g.buckets(), blocks = ctx / g.window;
+     Paged bp(rng, n_seq, ctx, g.window, 2);
+@@ -267,12 +383,34 @@ inline void select(const Backend& run, Tally& tl, const rad_lsa::Geom& g, int64_
+                            opd(sel, RAD_I32, { M, W }), opd(nsel, RAD_I32, { M }) };
+     std::vector<RadParam> p = geom_params(g);
+     p.push_back(pint("M", M));
+-    const int rc = run("r4d_rad_lsa_select", t, p, scratch);
+-    char what[220];
++    int rc = RAD_OK;
++    if (chunk <= 0) {
++        rc = run("r4d_rad_lsa_select", t, p, scratch);
++    } else {
++        /* A chunk of rows a launch at `row0`: the chunk's iq, pos, score, sel and nsel, the step's cu. */
++        for (int64_t off = 0; off < M && rc == RAD_OK; off += chunk) {
++            const int64_t n = std::min(chunk, M - off);
++            std::vector<float> ci(iq.begin() + off * D, iq.begin() + (off + n) * D), cs((size_t)(n * live), 0.0f);
++            std::vector<int32_t> cp(pos.begin() + off, pos.begin() + off + n), cl(sel.begin() + off * W, sel.begin() + (off + n) * W),
++                                 cn(nsel.begin() + off, nsel.begin() + off + n);
++            std::vector<Opd> tc = { opd(ci, RAD_F32, { n, D }), opd(cp, RAD_I32, { n }), opd(cu, RAD_I32, { n_seq + 1 }),
++                                    opd(bkt, RAD_U8, { bp.pages, 1, g.window, PB / g.window }),
++                                    opd(bp.bt, RAD_I32, { n_seq, bp.cols }), opd(cs, RAD_F32, { n, live }),
++                                    opd(cl, RAD_I32, { n, W }), opd(cn, RAD_I32, { n }) };
++            std::vector<RadParam> pc = geom_params(g);
++            pc.push_back(pint("M", n));
++            pc.push_back(pint("row0", off));
++            rc = run("r4d_rad_lsa_select", tc, pc, scratch);
++            std::copy(cl.begin(), cl.end(), sel.begin() + off * W);
++            std::copy(cn.begin(), cn.end(), nsel.begin() + off);
++        }
++    }
++    char what[240];
+     std::snprintf(what, sizeof what, "lsa_select window %lld top_k %lld top_p %lld, %lld rows over %lld "
+                   "buckets a sequence%s%s", (long long)g.window, (long long)g.top_k, (long long)g.top_p,
+                   (long long)M, (long long)(blocks * NB), dup ? ", with ties" : "",
+                   scratch ? ", the first digit counted by the scan" : "");
++    if (chunk > 0) std::snprintf(what + std::strlen(what), sizeof what - std::strlen(what), ", %lld rows a launch", (long long)chunk);
+     tl.check(rc == RAD_OK, std::string(what) + ": status");
+     int64_t bad = 0;
+     for (int64_t m = 0; m < M; ++m) {
+@@ -394,6 +532,11 @@ inline bool fixture(const Backend& run, const std::string& path, int64_t* blocks
+ inline void run_all(const Backend& run, Tally& tl, bool large) {
+     index_store(run, tl, 37, 24, 4, 256, 64, 1);   /* Qwen3.5/3.8's attention */
+     index_store(run, tl, 5, 8, 2, 128, 32, 2);
++    index_store_split(run, tl, 37, 24, 2, 256, 64, 2, 21);   /* Flash-Next at two ranks */
++    index_store_split(run, tl, 9, 16, 4, 128, 32, 4, 22);
++    pages(run, tl, 4, 0, 23);
++    pages(run, tl, 4, 300, 24);
++    pages(run, tl, 16, 7, 25);
+     rad_lsa::Geom small;
+     small.window = 64; small.top_k = 96; small.top_p = 24;
+     rad_lsa::Geom design;   /* the flat design's own sizes */
+@@ -412,6 +555,10 @@ inline void run_all(const Backend& run, Tally& tl, bool large) {
+         select(run, tl, small, 2, 64 * 30, { { 0, 64 * 29 + 3 }, { 0, 64 * 30 - 1 }, { 1, 64 * 25 } }, 30, 6,
+                scratch);
+         select(run, tl, small, 1, 64 * 2, { { 0, 64 * 2 - 1 }, { 0, 64 + 1 } }, 0, 7, scratch);
++        /* A prefill's rows a chunk at a time (row0), the sequences cut across the chunks. */
++        select(run, tl, small, 3, 64 * 40,
++               { { 0, 5 }, { 0, 63 }, { 0, 64 }, { 0, 127 }, { 0, 64 * 40 - 1 }, { 1, 64 * 3 + 7 },
++                 { 1, 64 * 20 }, { 1, 64 * 20 + 1 }, { 1, 64 * 20 + 2 }, { 2, 64 * 39 + 63 } }, 0, 5, scratch, 3);
+         if (large) {
+             select(run, tl, design, 2, 512 * 24,
+                    { { 0, 512 * 24 - 1 }, { 0, 512 * 9 + 100 }, { 1, 512 * 23 }, { 1, 512 * 23 + 1 } }, 0, 8,
+diff --git a/tests/r4d_emu/test_lsa.cpp b/tests/r4d_emu/test_lsa.cpp
+index f4614dc..bac2106 100644
+--- a/tests/r4d_emu/test_lsa.cpp
++++ b/tests/r4d_emu/test_lsa.cpp
+@@ -13,6 +13,7 @@ extern "C" int r4d_rad_lsa_index_store(const RadArgs*, RadStream);
+ extern "C" int r4d_rad_lsa_cluster(const RadArgs*, RadStream);
+ extern "C" int r4d_rad_lsa_select(const RadArgs*, RadStream);
+ extern "C" int64_t r4d_rad_lsa_select_scratch(const RadArgs*);
++extern "C" int r4d_rad_lsa_pages(const RadArgs*, RadStream);
+ 
+ int main() {
+     lsa_cases::Tally tl;
+@@ -20,6 +21,7 @@ int main() {
+                                        const std::vector<RadParam>& p, bool scratch) {
+         const lsa_cases::Launch fn = !std::strcmp(sym, "r4d_rad_lsa_index_store") ? r4d_rad_lsa_index_store
+                                    : !std::strcmp(sym, "r4d_rad_lsa_cluster")     ? r4d_rad_lsa_cluster
++                                   : !std::strcmp(sym, "r4d_rad_lsa_pages")       ? r4d_rad_lsa_pages
+                                                                                    : r4d_rad_lsa_select;
+         std::vector<RadTensor> ts;
+         for (const lsa_cases::Opd& o : t) ts.push_back(lsa_cases::tensor_of(o, o.data));
+-- 
+2.53.0
+

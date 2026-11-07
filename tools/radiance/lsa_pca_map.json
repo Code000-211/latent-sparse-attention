@@ -1,0 +1,93 @@
+{
+  "input": "key_and_query",
+  "run": "radiance-dump-pca",
+  "checkpoint": "step0 (PCA init)",
+  "date": "2026-11-07",
+  "note": "D-LSA training-free: PCA of the position-free key heads, dumped by Radiance (qwen3.8-next-flash-fp8-iq4r-moe, YaRN x9). tau not calibrated.",
+  "layers": {
+    "3": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.6135,
+      "top256_overlap": 0.655
+    },
+    "7": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.5789,
+      "top256_overlap": 0.651
+    },
+    "11": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.6932,
+      "top256_overlap": 0.762
+    },
+    "15": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.7714,
+      "top256_overlap": 0.748
+    },
+    "19": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.7456,
+      "top256_overlap": 0.751
+    },
+    "23": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.7547,
+      "top256_overlap": 0.709
+    },
+    "27": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.7526,
+      "top256_overlap": 0.734
+    },
+    "31": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.8034,
+      "top256_overlap": 0.705
+    },
+    "35": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.7767,
+      "top256_overlap": 0.665
+    },
+    "39": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.7918,
+      "top256_overlap": 0.685
+    },
+    "43": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.7445,
+      "top256_overlap": 0.587
+    },
+    "47": {
+      "docs": 8,
+      "rows": 8192,
+      "dim": 384,
+      "variance_kept": 0.7129,
+      "top256_overlap": 0.657
+    }
+  }
+}

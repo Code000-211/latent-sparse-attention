@@ -1,0 +1,39 @@
+From eb06a15c53bcdc20fe05be7ab5a4c86d2c97cdb3 Mon Sep 17 00:00:00 2001
+From: lsa <lsa@local>
+Date: Sat, 7 Nov 2026 03:43:29 +0000
+Subject: [PATCH 7/7] lsa: port fixups onto 1.15.1 (ABI 33, ops doc, abi test)
+
+---
+ docs/OPS.md               | 2 +-
+ tests/abi_layout_test.cpp | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/docs/OPS.md b/docs/OPS.md
+index e4be620..3552bc2 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -3279,7 +3279,7 @@ do not depend on the batch.
+ 
+ | op | params | operands |
+ |---|---|---|
+-| `lsa_index_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `rot` `dim` `block_size` `map_kv`/opt `kv0`/opt `mode`/opt | `q`, `k`, `map`, `slot`, `cache`:inout → `iq`, `part`/opt:inout |
++| `lsa_index_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `rot` `dim` `block_size` `map_kv`/opt `kv0`/opt `mode`/opt | `q`, `k`, `map`, `slot`, `cache`:inout? → `iq`?, `part`:inout? |
+ | `lsa_cluster` | `M`(range) `window` `pool` `bucket` `cap` `dim` `block_size` | `pos`, `cu`, `idx`, `idx_bt`, `bkt`:inout, `bkt_bt` |
+ | `lsa_select` | `M`(range) `window` `sink` `top_k` `top_p` `pool` `bucket` `cap` `dim` `row0`/opt | `iq`, `pos`, `cu`, `bkt`, `bkt_bt`, `score`:inout → `sel`, `nsel` |
+ | `lsa_pages` | `M`(range) `block_size` `row0`/opt | `sel`, `nsel`, `cu`, `bt` → `psel`, `pnsel`, `sequ` |
+diff --git a/tests/abi_layout_test.cpp b/tests/abi_layout_test.cpp
+index 16f0fc0..dd3ec69 100644
+--- a/tests/abi_layout_test.cpp
++++ b/tests/abi_layout_test.cpp
+@@ -59,7 +59,7 @@ std::vector<Row> cpp_rows() {
+ }
+ 
+ /* The layout at RAD_ABI_VERSION 33 / RAD_FORMAT_VER 2 (see the file header). */
+-constexpr uint33_t kTableAbi = 33, kTableFormat = 2;
++constexpr uint32_t kTableAbi = 33, kTableFormat = 2;
+ const AbiRow kTable[] = {
+ #include "abi_layout_table.h"
+ };
+-- 
+2.53.0
+

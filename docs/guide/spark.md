@@ -76,8 +76,8 @@ A step that submits a job waits for it and fails with its traceback. Logs are un
 teacher's attention its selection keeps and how many of the teacher's strongest keys it finds. These are offline
 numbers, and QSA is not among them: the extraction keeps QSA's own picks only with `data.queries.native: true`, which
 this config leaves off. The served comparison - RULER
-and PaperTrail at the same lengths, against QSA - needs the map served, which is the work planned in RadianceSwap's
-`docs/LSA.md`.
+and PaperTrail at the same lengths, against QSA - needs the map served. [radiance.md](radiance.md) serves a PCA map
+of the same model in Radiance, fitted there from Radiance's own activations.
 
 ## What is untested
 

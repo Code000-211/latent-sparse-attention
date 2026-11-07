@@ -1,0 +1,26 @@
+From 534d627e98c492507bcc3f6c33a23464c12458cf Mon Sep 17 00:00:00 2001
+From: Hero <caleb@calebgj.io>
+Date: Fri, 6 Nov 2026 04:50:46 +0000
+Subject: [PATCH 5/7] lsa: the gated block passes attn_paged_list its sel_max
+ (the select's list width)
+
+(cherry picked from commit 0b86554595c0b6bab649689771d75c2de341e920)
+---
+ arch/common/rad_block_attn_gated.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/common/rad_block_attn_gated.h b/arch/common/rad_block_attn_gated.h
+index e05ad82..2a073c0 100644
+--- a/arch/common/rad_block_attn_gated.h
++++ b/arch/common/rad_block_attn_gated.h
+@@ -237,6 +237,7 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
+                                             RAD_INT("causal", 1), RAD_INT("window", 0),
+                                             RAD_INT("n_head", g.n_head),
+                                             RAD_INT("block_size", rad_kv_block_size(b, kv)),
++                                            RAD_INT("sel_max", lsa_shared->width),
+                                             RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                             RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                                  RAD_NOWEIGHTS),
+-- 
+2.53.0
+

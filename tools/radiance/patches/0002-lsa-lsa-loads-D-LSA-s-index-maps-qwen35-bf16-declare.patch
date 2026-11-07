@@ -1,0 +1,1149 @@
+From 98f84c96cf44d9270ace824c574248e8c7618305 Mon Sep 17 00:00:00 2001
+From: Hero <caleb@calebgj.io>
+Date: Thu, 5 Nov 2026 22:50:37 +0000
+Subject: [PATCH 2/7] lsa: --lsa loads D-LSA's index maps; qwen35 bf16 declares
+ the index side
+
+--lsa MAP reads the paper's d-lsa-weights-v1 torch zip ({L}.W_Q_idx and
+{L}.W_K_idx a full-attention layer) without running its pickle, checks it
+and the sizes (--lsa-window, -sink, -top-k, -top-p, -pool, -bucket,
+-bucket-cap, the flat design's defaults), and gives each rank a bf16 copy
+through RadBuildCtx::lsa (ABI 38, RadLsaMap; RadArchProbe::lsa_ok).
+
+arch/common/rad_block_lsa.h declares the two KV groups (kv_lsa_idx paged
+like the attention's cache, kv_lsa_bkt a page a cluster block) and the
+three ops a full-attention layer; rad_block_attn_gated.h issues them after
+kv_store and, where a library declares attn_paged_list, attends the decode
+rows over their lists and a mixed step's prefill half densely. Without the
+flag nothing is declared: arch_test's pinned graphs are unchanged.
+
+(cherry picked from commit 2bee9f79da6e6a7f6a65640424e9fa19f47ae452)
+---
+ abi/rad_abi.h                      |   2 +-
+ abi/rad_abi_layout_rows.h          |  16 +++
+ abi/rad_builder.h                  |  38 ++++++
+ arch/common/rad_block_attn_gated.h |  74 +++++++++--
+ arch/common/rad_block_lsa.h        | 207 +++++++++++++++++++++++++++++
+ arch/qwen35_bf16/qwen35_bf16.cpp   |  21 +++
+ core/config.cpp                    |  28 ++++
+ core/engine.cpp                    |   9 ++
+ core/engine.h                      |   6 +
+ core/engine_bringup.cpp            |  42 +++++-
+ core/lsa.cpp                       | 197 +++++++++++++++++++++++++++
+ core/lsa.h                         |  59 ++++++++
+ core/rad_core.h                    |  13 ++
+ tests/abi_layout_test.cpp          |   6 +-
+ tests/arch_test.cpp                |  97 ++++++++++++++
+ tests/config_test.cpp              |   3 +
+ 16 files changed, 803 insertions(+), 15 deletions(-)
+ create mode 100644 arch/common/rad_block_lsa.h
+ create mode 100644 core/lsa.cpp
+ create mode 100644 core/lsa.h
+
+diff --git a/abi/rad_abi.h b/abi/rad_abi.h
+index 7492d32..8a28681 100644
+--- a/abi/rad_abi.h
++++ b/abi/rad_abi.h
+@@ -19,7 +19,7 @@ extern "C" {
+  * version is refused at load with both versions printed. Each also exports the layout's fingerprint
+  * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
+  * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
+-#define RAD_ABI_VERSION 32u
++#define RAD_ABI_VERSION 33u
+ 
+ /* ================================================================== plugin identity */
+ /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
+diff --git a/abi/rad_abi_layout_rows.h b/abi/rad_abi_layout_rows.h
+index ae80613..73cb903 100644
+--- a/abi/rad_abi_layout_rows.h
++++ b/abi/rad_abi_layout_rows.h
+@@ -26,6 +26,7 @@ ABI_FIELD(RadArchProbe, state_f16_ok)
+ ABI_FIELD(RadArchProbe, tree_pays)
+ ABI_FIELD(RadArchProbe, gen_max_pixels)
+ ABI_FIELD(RadArchProbe, gen_max_refs)
++ABI_FIELD(RadArchProbe, lsa_ok)
+ ABI_STRUCT(RadArgs)
+ ABI_FIELD(RadArgs, t)
+ ABI_FIELD(RadArgs, n_t)
+@@ -134,6 +135,7 @@ ABI_FIELD(RadBuildCtx, calib_layer_hi)
+ ABI_FIELD(RadBuildCtx, calib_tokens)
+ ABI_FIELD(RadBuildCtx, gen_max_pixels)
+ ABI_FIELD(RadBuildCtx, gen_max_refs)
++ABI_FIELD(RadBuildCtx, lsa)
+ ABI_STRUCT(RadAudioGenBatch)
+ ABI_FIELD(RadAudioGenBatch, n_lane)
+ ABI_FIELD(RadAudioGenBatch, lane)
+@@ -225,6 +227,20 @@ ABI_FIELD(RadControlVector, dir)
+ ABI_FIELD(RadControlVector, scales)
+ ABI_FIELD(RadControlVector, n_embd)
+ ABI_FIELD(RadControlVector, n_layers)
++ABI_STRUCT(RadLsaMap)
++ABI_FIELD(RadLsaMap, maps)
++ABI_FIELD(RadLsaMap, map_of_layer)
++ABI_FIELD(RadLsaMap, n_layers)
++ABI_FIELD(RadLsaMap, n_maps)
++ABI_FIELD(RadLsaMap, key_dim)
++ABI_FIELD(RadLsaMap, index_dim)
++ABI_FIELD(RadLsaMap, window)
++ABI_FIELD(RadLsaMap, sink)
++ABI_FIELD(RadLsaMap, top_k)
++ABI_FIELD(RadLsaMap, top_p)
++ABI_FIELD(RadLsaMap, pool)
++ABI_FIELD(RadLsaMap, bucket)
++ABI_FIELD(RadLsaMap, bucket_cap)
+ ABI_STRUCT(RadAudioFormat)
+ ABI_FIELD(RadAudioFormat, struct_size)
+ ABI_FIELD(RadAudioFormat, audio_open)
+diff --git a/abi/rad_builder.h b/abi/rad_builder.h
+index 08ae1c6..70ebcc7 100644
+--- a/abi/rad_builder.h
++++ b/abi/rad_builder.h
+@@ -295,8 +295,41 @@ typedef struct RadBuildCtx {
+      * fixed buffers ignores them, and the core says so at startup. */
+     int64_t  gen_max_pixels;
+     int64_t  gen_max_refs;
++
++    /* ---- appended in ABI 33 (D-LSA) */
++    /* --lsa MAP: D-LSA's index maps and the flat design's sizes (RadLsaMap below), or null. Null,
++     * the zero-initialised default, declares nothing of it. The engine sets it only for a plugin
++     * whose probe sets RadArchProbe::lsa_ok and refuses the flag otherwise. */
++    const struct RadLsaMap* lsa;
+ } RadBuildCtx;
+ 
++/* ================================================================== D-LSA */
++/* Latent sparse attention (Prefrontal-AI, arXiv 2610.42147): a full-attention query reads its
++ * sinks, its window and the `top_k` keys of the `top_p` buckets its index query scores best,
++ * instead of its whole history. The buckets come from clustering each `window`-key block of index
++ * keys once, when it closes (libref/ref_lsa.h states the algorithm; docs/OPS.md `lsa_*` the ops).
++ *
++ * The map is the published `d-lsa-weights-v1` form, a torch zip of `{L}.W_Q_idx` and `{L}.W_K_idx`
++ * for each full-attention layer L, [key_dim, index_dim] f32, key_dim being every KV head's dims
++ * past its rotated prefix side by side. The engine loads it once at bringup (core/lsa.h) and gives
++ * each rank its device copy in bf16, one [2][key_dim][index_dim] block a map, W_Q first; the
++ * sizes are the flags' (--lsa-window and the rest), checked to nest as the design requires. */
++typedef struct RadLsaMap {
++    const void*    maps;           /* device, [n_maps][2][key_dim][index_dim] bf16 */
++    const int32_t* map_of_layer;   /* host, [n_layers]: model layer l's map, or -1 for none */
++    int64_t        n_layers;
++    int64_t        n_maps;
++    int64_t        key_dim;
++    int64_t        index_dim;
++    int64_t        window;         /* recent keys always read, and a cluster block's keys */
++    int64_t        sink;           /* first keys always read */
++    int64_t        top_k;          /* long-range keys read */
++    int64_t        top_p;          /* buckets a query picks */
++    int64_t        pool;           /* consecutive keys clustered as one */
++    int64_t        bucket;         /* average keys a bucket */
++    int64_t        bucket_cap;     /* most keys a bucket */
++} RadLsaMap;
++
+ /* ================================================================== control vectors */
+ /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:
+  *
+@@ -1605,6 +1638,11 @@ typedef struct RadArchProbe {
+      * gen_patches answer for them. */
+     int64_t gen_max_pixels;
+     int64_t gen_max_refs;
++
++    /* ---- appended in ABI 33 (D-LSA) */
++    /* Nonzero when the plugin declares D-LSA's index side for this model under RadBuildCtx::lsa.
++     * 64-bit so it starts past the older struct's tail padding. */
++    int64_t lsa_ok;
+ } RadArchProbe;
+ 
+ int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
+diff --git a/arch/common/rad_block_attn_gated.h b/arch/common/rad_block_attn_gated.h
+index 4e24719..e05ad82 100644
+--- a/arch/common/rad_block_attn_gated.h
++++ b/arch/common/rad_block_attn_gated.h
+@@ -26,6 +26,7 @@
+ #define RAD_BLOCK_ATTN_GATED_H
+ 
+ #include "rad_arch.h"
++#include "rad_block_lsa.h"
+ 
+ namespace rad {
+ namespace arch {
+@@ -70,6 +71,15 @@ struct AttnGatedBF16 {
+     rad_op op_attn = 0, op_kv_store = 0, op_sigmoid = 0, op_gate = 0;
+     rad_op op_o = 0, op_ar = 0, op_add = 0;
+ 
++    /* D-LSA (rad_block_lsa.h): set by the plugin before declare under --lsa, null otherwise, and
++     * then nothing below declares or issues any of it. With it the decode rows attend over their
++     * lists through `attn_paged_list` where a kernel library declares that op; without one the
++     * lists are not computed and the attention stays dense (the index keys and buckets are still
++     * kept, so the cache is the same either way). */
++    LsaShared* lsa_shared = nullptr;
++    LsaIndex   lsa{};
++    rad_op     op_attn_list = 0;
++
+     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
+                  int64_t rotary_dim, const Wire& wire, const Src& src);
+     void step(RadCtx* c, const RadBatch* batch) const;
+@@ -217,6 +227,23 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
+                          RAD_NOWEIGHTS),
+                      {w.k, w.v}, {});
+ 
++    if (lsa_shared) {
++        /* Declared before the index side's groups, which take their block sizes from the ops
++         * declared after them. */
++        if (rad_op_declared(b, "attn_paged_list"))
++            op_attn_list = rw(b, decl_attn(b, g, "attn_paged_list",
++                                 RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok),
++                                            RAD_INT("head_dim", g.head_dim), RAD_INT("gqa", g.gqa()),
++                                            RAD_INT("causal", 1), RAD_INT("window", 0),
++                                            RAD_INT("n_head", g.n_head),
++                                            RAD_INT("block_size", rad_kv_block_size(b, kv)),
++                                            RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
++                                            RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
++                                 RAD_NOWEIGHTS),
++                              {w.q, lsa_shared->sel, lsa_shared->nsel}, {w.attn});
++        RAD_ARCH_TRY(lsa.declare(b, nm, g, l, n_rot, kv, lsa_shared, w.q, w.k));
++    }
++
+     /* The gate, as two ops: the op vocabulary has no gated multiply with a bf16 output
+      * (`gated_had_quant_i8` is the same arithmetic with an int8 epilogue). The sigmoid reads the
+      * strided gate view of the interleaved projection into the contiguous gate buffer. */
+@@ -286,16 +313,43 @@ inline void AttnGatedBF16::step(RadCtx* c, const RadBatch* batch) const {
+     RAD_ISSUE(c, op_kv_store,
+               brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+ 
+-    /* The longest query length, not the token count, selects the attention band: a verify step and
+-     * a prefill chunk can have the same token count at very different q_len. */
+-    RAD_ISSUE_N(c, op_attn, batch->max_q_len,
+-                brows(w.q, T), kv_cache(kv, layer),
+-                praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+-                praw(used, RAD_I32, batch->n_seq),
+-                RAD_NONE, RAD_NONE,
+-                /* cu_seqlens: the batch may be ragged (a prefill chunk beside decode rows). */
+-                praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+-                brows(w.attn, T));
++    /* D-LSA: every row's index key, every block the step closes, the decode rows' lists. The
++     * decode half (sequences [0, D), rows [0, DT)) then attends over its lists and the prefill
++     * half densely, at the op's top band as rad_block_attn_gated_fp8.h issues a mixed step's. */
++    int64_t D = 0, DT = 0;
++    if (lsa.sh) {
++        lsa.store(c, batch, w.q, w.k);
++        batch_split(batch, &D, &DT);
++        if (!op_attn_list) DT = 0;
++        if (DT > 0) lsa.select(c, batch, D, DT);
++    }
++    if (DT > 0) {
++        const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
++        RAD_ISSUE_N(c, op_attn_list,
++                    batch->max_q_len_decode > 0 ? batch->max_q_len_decode : batch->max_q_len,
++                    brows(w.q, DT), kv_cache(kv, layer), praw2(table, RAD_I32, D, pitch),
++                    praw(used, RAD_I32, D), RAD_NONE, RAD_NONE,
++                    praw(batch->cu_seqlens, RAD_I32, D + 1), brows(w.attn, DT),
++                    brows(lsa.sh->sel, DT), brows(lsa.sh->nsel, DT));
++        if (D < batch->n_seq) {
++            const int64_t P = batch->n_seq - D;
++            RAD_ISSUE_N(c, op_attn, g.max_tok, brows(w.q, T), kv_cache(kv, layer),
++                        praw2(table ? table + D * pitch : nullptr, RAD_I32, P, pitch),
++                        praw(used ? used + D : nullptr, RAD_I32, P), RAD_NONE, RAD_NONE,
++                        praw(batch->cu_seqlens + D, RAD_I32, P + 1), brows(w.attn, T));
++        }
++    } else {
++        /* The longest query length, not the token count, selects the attention band: a verify
++         * step and a prefill chunk can have the same token count at very different q_len. */
++        RAD_ISSUE_N(c, op_attn, batch->max_q_len,
++                    brows(w.q, T), kv_cache(kv, layer),
++                    praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
++                    praw(used, RAD_I32, batch->n_seq),
++                    RAD_NONE, RAD_NONE,
++                    /* cu_seqlens: the batch may be ragged (a prefill chunk beside decode rows). */
++                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
++                    brows(w.attn, T));
++    }
+ 
+     /* out = attn * sigmoid(gate), the gate read out of the interleaved projection. */
+     RAD_ISSUE_N(c, op_sigmoid, T * g.n_head,
+diff --git a/arch/common/rad_block_lsa.h b/arch/common/rad_block_lsa.h
+new file mode 100644
+index 0000000..47a7962
+--- /dev/null
++++ b/arch/common/rad_block_lsa.h
+@@ -0,0 +1,207 @@
++/* rad_block_lsa.h -- D-LSA's index side for a full-attention block: index keys, closed-block
++ * clustering and the decode rows' key lists.
++ *
++ *   rope -> kv_store -> lsa_index_store -> lsa_cluster -> lsa_select (decode rows) -> attention
++ *
++ * D-LSA (latent sparse attention, Prefrontal-AI, arXiv 2610.42147, Apache-2.0) lets a decode query
++ * read its sinks, its window and the `top_k` keys of the `top_p` buckets its index query scores
++ * best, instead of its whole history (abi/rad_builder.h RadLsaMap; libref/ref_lsa.h states the
++ * algorithm, libr4d/r4d_lsa.hip runs it). It is off unless the deployment gives --lsa
++ * (RadBuildCtx::lsa); off, a block declares none of this, so its graph and bytes are unchanged.
++ *
++ * Two KV groups beside the attention's, declared by the first layer that asks, since a group's
++ * block size comes from the op declared to read it (spec §7.2):
++ *
++ *   kv_lsa_idx  a token's index key, bf16 [64], paged like the attention's cache. The block manager
++ *               pages a K and a V half, so the group is declared at head_dim 32: the operand is
++ *               [blocks, 1, block, 64], one row a token. `lsa_index_store` reads it.
++ *   kv_lsa_bkt  a closed block's buckets, one page a cluster block (`window` tokens): centroids
++ *               then members, (64 + cap) * 2 bytes a bucket, declared as bytes. `lsa_cluster`
++ *               writes it; `lsa_select` reads it.
++ *
++ * Both are read over the whole history (a block is clustered from the keys of the block just
++ * closed, and every decode row scores every closed block), so neither streams
++ * (rad_kv_group_dense_read). Both are cached and restored with the attention's pages: a closed
++ * block's buckets are a function of its tokens, as its KV is. The bucket group's `window`-token
++ * page makes the step's chunk quantum a multiple of the window (core/sched/geometry.cpp).
++ *
++ * The lists are the decode rows' only: a prefill chunk stores its index keys and closes its blocks
++ * but attends densely (block-sparse prefill is the paper's second phase). A sequence's rows close
++ * every block whose last key they write, so a rejected draft's rewrite of that key clusters the
++ * block again when it is written next.
++ *
++ * Under tensor parallelism an index key sums every KV head and an index query every query head of
++ * the layer, so each rank holds a partial projection; the all_reduce that would join them is not
++ * declared yet, and a deployment above one rank is refused. */
++#ifndef RAD_BLOCK_LSA_H
++#define RAD_BLOCK_LSA_H
++
++#include "rad_arch.h"
++
++namespace rad {
++namespace arch {
++
++/* Declared once by the plugin and shared by every full-attention layer: the map, the two groups
++ * (the first layer's declare fills them in) and the activation buffers. */
++struct LsaShared {
++    const RadLsaMap* map = nullptr;
++    rad_kvgroup idx = 0, bkt = 0;
++    rad_buf iq = 0;       /* [max_tok, 64] f32 index queries */
++    rad_buf score = 0;    /* [rows, live_max] f32 bucket scores */
++    rad_buf sel = 0;      /* [rows, width] i32 key positions, ascending, -1 padded */
++    rad_buf nsel = 0;     /* [rows] i32 */
++    int64_t rows = 0;     /* the decode rows one step may carry */
++    int64_t live_max = 0; /* the buckets of a context of max_ctx */
++    int64_t width = 0;    /* sink + top_k + window: the contract's S_max */
++    int64_t nb = 0;       /* buckets a cluster block */
++    int64_t page_hd = 0;  /* kv_lsa_bkt's declared head_dim, in bytes: a page is 2 * window * this */
++
++    int declare(RadBuilder* b, Names& nm, const Geom& g, int64_t n_rot, const RadLsaMap* m) {
++        map = m;
++        const int64_t free = g.head_dim - n_rot;
++        if (g.world > 1) {
++            fprintf(stderr, "radiance: --lsa: D-LSA's index key sums every KV head and its query "
++                            "every query head of a layer; at %d ranks each holds a partial "
++                            "projection, and the all_reduce that joins them is not declared yet. "
++                            "Serve it at one rank.\n", g.world);
++            return RAD_E_UNSUPPORTED;
++        }
++        if (m->index_dim != 64 || m->key_dim != g.n_head_kv * free || g.n_head % g.n_head_kv) {
++            fprintf(stderr, "radiance: --lsa: the maps are [%lld, %lld]; this model's index input "
++                            "is %lld KV heads of %lld position-free dims (%lld), into 64 index "
++                            "dims\n", (long long)m->key_dim, (long long)m->index_dim,
++                    (long long)g.n_head_kv, (long long)free, (long long)(g.n_head_kv * free));
++            return RAD_E_SHAPE;
++        }
++        nb = m->window / m->bucket;
++        /* A page is nb * (64 + cap) * 2 bytes, which the manager sizes as 2 * window * head_dim. */
++        if ((nb * (64 + m->bucket_cap) * 2) % (2 * m->window)) {
++            fprintf(stderr, "radiance: --lsa: a cluster block's buckets are %lld bytes, which is no "
++                            "whole number of bytes a token of its %lld-token page\n",
++                    (long long)(nb * (64 + m->bucket_cap) * 2), (long long)m->window);
++            return RAD_E_SHAPE;
++        }
++        page_hd = nb * (64 + m->bucket_cap) * 2 / (2 * m->window);
++        rows = g.max_seqs * (1 + (g.max_spec > 0 ? g.max_spec : 0));
++        live_max = (g.max_ctx + m->window - 1) / m->window * nb;
++        width = m->sink + m->top_k + m->window;
++        iq    = decl_b(b, nm.f("lsa_iq"),    RAD_F32, {g.max_tok, 64});
++        score = decl_b(b, nm.f("lsa_score"), RAD_F32, {rows, live_max});
++        sel   = decl_b(b, nm.f("lsa_sel"),   RAD_I32, {rows, width});
++        nsel  = decl_b(b, nm.f("lsa_nsel"),  RAD_I32, {rows});
++        return iq && score && sel && nsel ? RAD_OK : RAD_E_INVAL;
++    }
++};
++
++/* One full-attention layer's index side. */
++struct LsaIndex {
++    Geom             g{};
++    int              layer = 0;
++    int64_t          n_rot = 0;
++    const LsaShared* sh = nullptr;
++    const void*      map = nullptr;   /* this layer's [2][key_dim][64] bf16, W_Q first, on the card */
++    rad_op op_store = 0, op_cluster = 0, op_select = 0;
++
++    /* After the attention's own ops (its group's block size is read here). `q` and `k` are the
++     * block's normed and rotated query and key rows. */
++    int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, int64_t rotary_dim,
++                rad_kvgroup attn_kv, LsaShared* s, rad_buf q, rad_buf k) {
++        g = geom; layer = l; n_rot = rotary_dim; sh = s;
++        const RadLsaMap* m = s->map;
++        if (l < 0 || l >= m->n_layers || m->map_of_layer[l] < 0) {
++            fprintf(stderr, "radiance: --lsa: the maps have none for full-attention layer %d\n", l);
++            return RAD_E_INVAL;
++        }
++        map = (const uint8_t*)m->maps + (size_t)m->map_of_layer[l] * 2 * m->key_dim * 64 * 2;
++        const int64_t bs = rad_kv_block_size(b, attn_kv);
++
++        /* The index keys are paged like the attention's cache. */
++        if (!s->idx) {
++            RadKVGroupDecl d{};
++            d.kind = RAD_KV_FULL;
++            d.dtype = RAD_BF16;
++            d.n_head_kv = 1;
++            d.head_dim = 32;   /* K and V halves: one 64-wide row a token */
++            s->idx = rad_decl_kv_group(b, nm.f("kv_lsa_idx"), &d);
++            RAD_ARCH_TRY(rad_kv_group_dense_read(b, s->idx));
++        }
++        op_store = rw(b, RAD_OP(b, "lsa_index_store",
++                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
++                                     RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", g.n_head_kv),
++                                     RAD_INT("rot", n_rot), RAD_INT("dim", 64),
++                                     RAD_INT("block_size", bs)),
++                          RAD_NOWEIGHTS),
++                      {q, k}, {s->iq});
++        if (!op_store || rad_kv_block_size(b, s->idx) != bs) return RAD_E_INVAL;
++        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, s->idx));
++
++        /* A closed block's buckets, a page a block. */
++        if (!s->bkt) {
++            RadKVGroupDecl d{};
++            d.kind = RAD_KV_FULL;
++            d.dtype = RAD_U8;
++            d.n_head_kv = 1;
++            d.head_dim = s->page_hd;
++            s->bkt = rad_decl_kv_group(b, nm.f("kv_lsa_bkt"), &d);
++            RAD_ARCH_TRY(rad_kv_group_dense_read(b, s->bkt));
++        }
++        op_cluster = rw(b, RAD_OP(b, "lsa_cluster",
++                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("window", m->window),
++                                       RAD_INT("pool", m->pool), RAD_INT("bucket", m->bucket),
++                                       RAD_INT("cap", m->bucket_cap), RAD_INT("dim", 64),
++                                       RAD_INT("block_size", m->window)),
++                            RAD_NOWEIGHTS),
++                        {}, {});
++        /* Its page is `window` tokens, from `block_size` above; lsa_cluster refuses any other by
++         * name at launch. */
++        if (!op_cluster) return RAD_E_INVAL;
++        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, s->bkt));
++
++        op_select = rw(b, RAD_OP(b, "lsa_select",
++                           RAD_PARAMS(RAD_RANGE("M", 1, s->rows), RAD_INT("window", m->window),
++                                      RAD_INT("sink", m->sink), RAD_INT("top_k", m->top_k),
++                                      RAD_INT("top_p", m->top_p), RAD_INT("pool", m->pool),
++                                      RAD_INT("bucket", m->bucket), RAD_INT("cap", m->bucket_cap),
++                                      RAD_INT("dim", 64)),
++                           RAD_NOWEIGHTS),
++                       {s->iq}, {s->score, s->sel, s->nsel});
++        return op_select ? RAD_OK : RAD_E_INVAL;
++    }
++
++    /* Every row's index key and query, from the normed and rotated q and k, and every block the
++     * step's rows close. After kv_store. */
++    void store(RadCtx* c, const RadBatch* batch, rad_buf q, rad_buf k) const {
++        const RadKVGroupBatch* ib = kv_batch(batch, sh->idx);
++        const RadKVGroupBatch* bb = kv_batch(batch, sh->bkt);
++        const int64_t T = batch->n_tok, S = batch->n_seq;
++        RAD_ISSUE(c, op_store, brows(q, T), brows(k, T),
++                  praw2(map, RAD_BF16, 2 * sh->map->key_dim, 64),
++                  praw(ib ? ib->slot_mapping : nullptr, RAD_I32, T), kv_cache(sh->idx, layer),
++                  brows(sh->iq, T));
++        RAD_ISSUE(c, op_cluster, praw(batch->positions, RAD_I32, T),
++                  praw(batch->cu_seqlens, RAD_I32, S + 1), kv_cache(sh->idx, layer),
++                  praw2(ib ? ib->block_table : nullptr, RAD_I32, S, ib ? ib->block_table_pitch : 0),
++                  kv_cache(sh->bkt, layer),
++                  praw2(bb ? bb->block_table : nullptr, RAD_I32, S, bb ? bb->block_table_pitch : 0));
++    }
++
++    /* The decode rows' lists (sequences [0, D), rows [0, DT)) into sh->sel and sh->nsel. The score
++     * plane is viewed at the step's context bound, which the pass key holds (a recorded decode
++     * pass replays it until the bound crosses a bucket). */
++    void select(RadCtx* c, const RadBatch* batch, int64_t D, int64_t DT) const {
++        const RadKVGroupBatch* bb = kv_batch(batch, sh->bkt);
++        const RadLsaMap* m = sh->map;
++        int64_t live = ((int64_t)batch->max_ctx_len + batch->max_q_len) / m->window * sh->nb;
++        if (live > sh->live_max) live = sh->live_max;
++        if (live < 1) live = 1;
++        RAD_ISSUE_N(c, op_select, DT, brows(sh->iq, DT), praw(batch->positions, RAD_I32, DT),
++                    praw(batch->cu_seqlens, RAD_I32, D + 1), kv_cache(sh->bkt, layer),
++                    praw2(bb ? bb->block_table : nullptr, RAD_I32, D, bb ? bb->block_table_pitch : 0),
++                    bcol(sh->score, 0, live, DT), brows(sh->sel, DT), brows(sh->nsel, DT));
++    }
++};
++
++}  /* namespace arch */
++}  /* namespace rad */
++
++#endif /* RAD_BLOCK_LSA_H */
+diff --git a/arch/qwen35_bf16/qwen35_bf16.cpp b/arch/qwen35_bf16/qwen35_bf16.cpp
+index a7f9b9b..3cf68da 100644
+--- a/arch/qwen35_bf16/qwen35_bf16.cpp
++++ b/arch/qwen35_bf16/qwen35_bf16.cpp
+@@ -97,6 +97,10 @@ struct Model {
+ 
+     std::vector<Layer> layers;
+ 
++    /* --lsa: D-LSA's index side, shared by the full-attention layers (rad_block_lsa.h); its map
++     * is null without the flag, and nothing of it is declared. */
++    LsaShared lsa{};
++
+     /* --calib-dir: the whole Hessian of every linear's input over a --calib-corpus run. */
+     CalibFull calib;
+     int       cs_head = -1;     /* the lm_head's input, recorded with the last layer */
+@@ -338,6 +342,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                                RAD_NOWEIGHTS),
+                            {m.b_x}, {m.b_x});
+ 
++    if (ctx->lsa) RAD_ARCH_TRY(m.lsa.declare(b, nm, g, m.n_rot, ctx->lsa));
++
+     /* ---- the layers. */
+     AttnGatedBF16::Wire aw{};
+     aw.x = m.b_x; aw.h = m.b_h; aw.qg = m.b_qg; aw.k = m.b_k; aw.v = m.b_v;
+@@ -372,6 +378,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+             as.k_norm = nm.ckpt("%s.%lld.self_attn.k_norm.weight",    pre, (long long)l);
+             as.o      = nm.ckpt("%s.%lld.self_attn.o_proj.weight",    pre, (long long)l);
+             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
++            lay.attn.lsa_shared = ctx->lsa ? &m.lsa : nullptr;
+             RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as));
+         } else {
+             GdnBF16::Src gs{};
+@@ -472,12 +479,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+     if (nextn > 0)
+         rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not declared: this plugin "
+                     "serves the trunk only", (long long)nextn);
++    if (ctx->lsa)
++        rad_note(b, "D-LSA: window %lld, sink %lld, top_k %lld, top_p %lld; decode rows read at most "
++                    "%lld keys a layer%s", (long long)ctx->lsa->window, (long long)ctx->lsa->sink,
++                 (long long)ctx->lsa->top_k, (long long)ctx->lsa->top_p, (long long)m.lsa.width,
++                 rad_op_declared(b, "attn_paged_list") ? ""
++                     : " once a library declares attn_paged_list (dense until then)");
+ 
+     /* The vision tower, last, so its activations share the arena with every buffer above. */
+     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer + 64));
+     return RAD_OK;
+ }
+ 
++/* Only D-LSA's answer: every other field stays zero, as without the export. */
++static int probe(const RadModelMeta* meta, RadArchProbe* out) {
++    if (!meta || !out) return RAD_E_INVAL;
++    out->lsa_ok = 1;
++    return RAD_OK;
++}
++
+ static void step(RadCtx* c, const RadBatch* batch) {
+     Model& m = g_model[rad_rank(c)];
+ 
+@@ -545,4 +565,5 @@ static void step(RadCtx* c, const RadBatch* batch) {
+ RAD_ARCH_PLUGIN(qwen35_bf16, "qwen35", "", "0.1.0",
+                 "Qwen3.5 / 3.6 / 3.8 dense (0.8B..27B), bf16 weights and activations, gated "
+                 "attention over paged KV every fourth layer and gated delta net between")
++RAD_ARCH_PROBE(qwen35_bf16)
+ #endif
+diff --git a/core/config.cpp b/core/config.cpp
+index b0c63b4..4596a0c 100644
+--- a/core/config.cpp
++++ b/core/config.cpp
+@@ -160,6 +160,18 @@ static const Flag g_flags[] = {
+     "                                    disabled -- the default, also with no flag at all -- loads\n"
+     "                                    nothing: no projection op is declared, and a request that\n"
+     "                                    asks for the vector is refused" },
++    { "--lsa",                "MAP",    "D-LSA latent sparse attention (off by default): the index\n"
++    "                                    maps, a torch zip of {L}.W_Q_idx and {L}.W_K_idx a\n"
++    "                                    full-attention layer (d-lsa-weights-v1). A decode query then\n"
++    "                                    reads its sinks, its window and the top-k keys of its best\n"
++    "                                    buckets instead of its whole context" },
++    { "--lsa-window",         "N",      "D-LSA's window, and the keys a block clusters (default 512)" },
++    { "--lsa-sink",           "N",      "D-LSA's first keys always read (default 4)" },
++    { "--lsa-top-k",          "N",      "D-LSA's long-range keys a query reads (default 4096)" },
++    { "--lsa-top-p",          "N",      "D-LSA's buckets a query picks (default 1024)" },
++    { "--lsa-pool",           "N",      "D-LSA's consecutive keys clustered as one (default 4)" },
++    { "--lsa-bucket",         "N",      "D-LSA's average keys a bucket (default 8)" },
++    { "--lsa-bucket-cap",     "N",      "D-LSA's most keys a bucket (default 16)" },
+     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
+     "                                    set cannot change under the heat engine. The sampler is\n"
+     "                                    already order-independent and needs no pinning; note that\n"
+@@ -738,6 +750,14 @@ int config_parse(int argc, char** argv, Config* c) {
+             }
+             c->control_vector = v;
+         }
++        else if (S("--lsa"))             { if (!(v = need(i))) return RAD_E_INVAL; c->lsa_map = v; }
++        else if (S("--lsa-window"))      { if (!num(1, 1 << 20, &c->lsa_window)) return RAD_E_INVAL; }
++        else if (S("--lsa-sink"))        { if (!num(0, 1 << 20, &c->lsa_sink)) return RAD_E_INVAL; }
++        else if (S("--lsa-top-k"))       { if (!num(1, 1 << 20, &c->lsa_top_k)) return RAD_E_INVAL; }
++        else if (S("--lsa-top-p"))       { if (!num(1, 1 << 20, &c->lsa_top_p)) return RAD_E_INVAL; }
++        else if (S("--lsa-pool"))        { if (!num(1, 1 << 20, &c->lsa_pool)) return RAD_E_INVAL; }
++        else if (S("--lsa-bucket"))      { if (!num(1, 1 << 20, &c->lsa_bucket)) return RAD_E_INVAL; }
++        else if (S("--lsa-bucket-cap"))  { if (!num(1, 1 << 20, &c->lsa_bucket_cap)) return RAD_E_INVAL; }
+         else if (S("--deterministic"))         c->deterministic = true;
+         else if (S("--checkpoint-interval"))   { if (!num(0, INT64_MAX, &c->checkpoint_interval)) return RAD_E_INVAL; }
+         else if (S("--prefill-span"))          { if (!num(1, INT32_MAX, &c->prefill_span)) return RAD_E_INVAL; }
+@@ -1363,6 +1383,14 @@ const ShowRow kShow[] = {
+           return o.empty() ? std::string(c.lora.enabled() ? "the adapters' own" : "-") : o; } },
+     { "--placement",          [](const Config& c) { return c.placement; } },
+     { "--control-vector",     [](const Config& c) { return c.control_vector; } },
++    { "--lsa",                [](const Config& c) { return c.lsa_map.empty() ? std::string("off") : c.lsa_map; } },
++    { "--lsa-window",         [](const Config& c) { return num(c.lsa_window); } },
++    { "--lsa-sink",           [](const Config& c) { return num(c.lsa_sink); } },
++    { "--lsa-top-k",          [](const Config& c) { return num(c.lsa_top_k); } },
++    { "--lsa-top-p",          [](const Config& c) { return num(c.lsa_top_p); } },
++    { "--lsa-pool",           [](const Config& c) { return num(c.lsa_pool); } },
++    { "--lsa-bucket",         [](const Config& c) { return num(c.lsa_bucket); } },
++    { "--lsa-bucket-cap",     [](const Config& c) { return num(c.lsa_bucket_cap); } },
+     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
+     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
+     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },
+diff --git a/core/engine.cpp b/core/engine.cpp
+index 83d8d62..b780bdd 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -74,6 +74,15 @@ Engine::~Engine() {
+         cvec_views_[(size_t) r->index].dir = nullptr;
+     }
+     cvec_views_.clear();
++    /* D-LSA's per-rank map copies, likewise. */
++    for (const auto& r : ranks_) {
++        if (!r || (size_t) r->index >= lsa_views_.size()) continue;
++        const void* d = lsa_views_[(size_t) r->index].maps;
++        if (!d || rad_dev_set(r->device) < 0) continue;
++        rad_dev_free((void*) d, RAD_MEM_DEVICE);
++        lsa_views_[(size_t) r->index].maps = nullptr;
++    }
++    lsa_views_.clear();
+     /* --profile-ops prints its final table here, the last point where the program still holds
+      * the op table the rows name. */
+     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
+diff --git a/core/engine.h b/core/engine.h
+index 13bd3d4..5a52441 100644
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -21,6 +21,7 @@
+ #include "rad_core.h"
+ #include "rad_spechub.h"   /* RadMtpCoupleDraw/State: the coupled MTP wire rows */
+ #include "cvec.h"
++#include "lsa.h"
+ #include <map>
+ #include <set>
+ #include "build/startup.h"
+@@ -636,6 +637,11 @@ private:
+      * POST /admin/control-vector). Atomic: the server's admin thread writes it while
+      * request threads read it; nothing about the graph changes with it. */
+     std::atomic<bool>              cvec_default_{false};
++    /* ---- D-LSA's index maps (core/lsa.h), loaded once at bringup from --lsa and empty without it;
++     * `lsa_views_` is, per rank, the ABI view build_ctx hands a declaring plugin, whose `maps` is
++     * that rank's device copy (freed with the engine, as a control vector's). */
++    LsaMap                         lsa_;
++    std::vector<RadLsaMap>         lsa_views_;
+     std::vector<std::string> env_set_;   /* the RADIANCE_* names set when the engine was made */
+     bool        report_printed_ = false;
+     /* Runtime device identity (PCI address, name, integrated flag, runtime version), read once in
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index c290455..fece03b 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -1021,6 +1021,10 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
+     if (cvec_.loaded() && rank >= 0 && rank < (int) cvec_views_.size() &&
+         cvec_views_[(size_t) rank].dir)
+         bc.cvec = &cvec_views_[(size_t) rank];
++    /* D-LSA's maps, when --lsa loaded them: this rank's view, or null. Read at declare only. */
++    if (lsa_.loaded() && rank >= 0 && rank < (int) lsa_views_.size() &&
++        lsa_views_[(size_t) rank].maps)
++        bc.lsa = &lsa_views_[(size_t) rank];
+     return bc;
+ }
+ 
+@@ -1354,6 +1358,32 @@ int Engine::declare() {
+         cvec_default_.store(false);
+     }
+ 
++    /* D-LSA (core/lsa.h). Without --lsa nothing is read and the graph declares none of it. With it,
++     * a plugin that does not serve it for this model (RadArchProbe::lsa_ok) or a map that does not
++     * fit is refused: the operator asked for the feature. */
++    if (!cfg_.lsa_map.empty()) {
++        RadArchProbe pb{};
++        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
++        if (!pb.lsa_ok) {
++            RAD_ERR("--lsa %s: the '%s' plugin does not serve D-LSA for this model",
++                    cfg_.lsa_map.c_str(), plugins_.arch_plugin.c_str());
++            return RAD_E_UNSUPPORTED;
++        }
++        std::string why;
++        if (lsa_map_load(cfg_.lsa_map, meta_.n_layers, cfg_, &lsa_, &why) != RAD_OK) {
++            RAD_ERR("--lsa %s: %s", cfg_.lsa_map.c_str(), why.c_str());
++            lsa_ = LsaMap{};
++            return RAD_E_INVAL;
++        }
++        lsa_views_.assign(ranks_.size(), RadLsaMap{});
++        RAD_INFO("D-LSA: %s: %lld layers of [%lld, %lld] maps; window %lld, sink %lld, top_k %lld, "
++                 "top_p %lld, pool %lld, bucket %lld (cap %lld)",
++                 lsa_.path.c_str(), (long long) lsa_.n_maps(), (long long) lsa_.key_dim,
++                 (long long) lsa_.index_dim, (long long) lsa_.window, (long long) lsa_.sink,
++                 (long long) lsa_.top_k, (long long) lsa_.top_p, (long long) lsa_.pool,
++                 (long long) lsa_.bucket, (long long) lsa_.bucket_cap);
++    }
++
+     /* Declare once per rank (rank and world_size in RadBuildCtx; the plugin declares dimensions
+      * already divided, spec §9), every rank concurrently on its own thread. Concurrency is
+      * required: kernel init() runs during declare, and a collective's init is a rendezvous
+@@ -1385,6 +1415,15 @@ int Engine::declare() {
+                 }
+                 cvec_views_[(size_t)ri] = control_vector_view(cvec_, d);
+             }
++            /* This rank's copy of D-LSA's maps, the same way. */
++            if (lsa_.loaded()) {
++                const void* d = lsa_map_upload(lsa_, ri);
++                if (!d) {
++                    st[(size_t)ri] = RAD_E_DEVICE;
++                    return;
++                }
++                lsa_views_[(size_t)ri] = lsa_map_view(lsa_, d);
++            }
+             const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
+             LoraDeclare ld;
+             ld.cfg = &cfg_.lora;
+@@ -1860,7 +1899,8 @@ int Engine::plan() {
+          * claiming its bytes back keeps a deployment that offers a vector planning against the
+          * same card as one that does not (VramFacts::held_out). */
+         const int64_t cvec_bytes = cvec_.loaded() ? (int64_t) cvec_.dir.size() * 4 : 0;
+-        for (VramFacts& f : facts) f.held_out = cvec_bytes;
++        /* D-LSA's map copies likewise. */
++        for (VramFacts& f : facts) f.held_out = cvec_bytes + lsa_.bytes();
+         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
+                                         ngram_device, ngram_host, ck_store + host_arenas));
+         /* --draft-expert-placement host: the drafter's experts are pinned in the host pool before
+diff --git a/core/lsa.cpp b/core/lsa.cpp
+new file mode 100644
+index 0000000..307bbe5
+--- /dev/null
++++ b/core/lsa.cpp
+@@ -0,0 +1,197 @@
++/* lsa.cpp -- reading and checking D-LSA's index maps (core/lsa.h). The reader is
++ * core/format/torch_zip.cpp, which maps the archive and interprets its pickle as data. */
++#include "lsa.h"
++
++#include "format/torch_zip.h"
++#include "rad_core.h"
++
++#include <array>
++#include <cstring>
++#include <map>
++
++namespace rad {
++
++namespace {
++
++/* `{L}.W_Q_idx` or `{L}.W_K_idx`: the layer and the side (0 query, 1 key), or false. */
++bool parse_name(const std::string& n, int64_t* layer, int* side) {
++    const size_t dot = n.find('.');
++    if (dot == 0 || dot == std::string::npos || dot > 9) return false;
++    for (size_t i = 0; i < dot; ++i)
++        if (n[i] < '0' || n[i] > '9') return false;
++    const std::string rest = n.substr(dot + 1);
++    if (rest == "W_Q_idx") *side = 0;
++    else if (rest == "W_K_idx") *side = 1;
++    else return false;
++    *layer = std::stoll(n.substr(0, dot));
++    return true;
++}
++
++uint16_t bf16_of(float f) {
++    uint32_t u;
++    std::memcpy(&u, &f, 4);
++    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 0x40u);
++    u += 0x7fffu + ((u >> 16) & 1u);
++    return (uint16_t) (u >> 16);
++}
++
++}  /* namespace */
++
++const char* lsa_sizes_refusal(int64_t window, int64_t sink, int64_t top_k, int64_t top_p,
++                              int64_t pool, int64_t bucket, int64_t bucket_cap) {
++    if (window < 1 || sink < 0 || top_k < 1 || top_p < 1 || pool < 1 || bucket < 1 || bucket_cap < 1)
++        return "every size must be positive (the sinks may be 0)";
++    if (bucket % pool || bucket_cap % pool)
++        return "--lsa-pool must divide --lsa-bucket and --lsa-bucket-cap";
++    if (window % bucket) return "--lsa-bucket must divide --lsa-window, the keys a block clusters";
++    if (bucket_cap < 2 * bucket)
++        return "--lsa-bucket-cap must be at least twice --lsa-bucket, or Ward can stop short of a "
++               "block's bucket count";
++    if (top_p * bucket_cap < top_k)
++        return "--lsa-top-p buckets of --lsa-bucket-cap keys cannot fill --lsa-top-k";
++    return nullptr;
++}
++
++int lsa_map_load(const std::string& path, int64_t n_model_layers, const Config& cfg, LsaMap* out,
++                 std::string* err) {
++    if (!out || !err) return RAD_E_INVAL;
++    *out = LsaMap{};
++    if (const char* why = lsa_sizes_refusal(cfg.lsa_window, cfg.lsa_sink, cfg.lsa_top_k,
++                                            cfg.lsa_top_p, cfg.lsa_pool, cfg.lsa_bucket,
++                                            cfg.lsa_bucket_cap)) {
++        *err = why;
++        return RAD_E_INVAL;
++    }
++    TorchZipFile f;
++    std::string why;
++    const int rc = f.open(path, &why);
++    if (rc != RAD_OK) {
++        *err = "not a readable torch zip: " + why;
++        return rc;
++    }
++    /* layer -> its two tensors */
++    std::map<int64_t, std::array<const TorchTensor*, 2>> by_layer;
++    for (const TorchTensor& t : f.tensors()) {
++        int64_t layer = 0;
++        int side = 0;
++        if (!parse_name(t.name, &layer, &side)) {
++            *err = "'" + t.name + "' is not a map's name: an index map is {L}.W_Q_idx and "
++                   "{L}.W_K_idx for each full-attention layer L";
++            return RAD_E_INVAL;
++        }
++        if (layer >= n_model_layers) {
++            *err = "'" + t.name + "' names layer " + std::to_string(layer) + ", and the model has " +
++                   std::to_string(n_model_layers);
++            return RAD_E_INVAL;
++        }
++        if (t.dtype != RAD_F32 && t.dtype != RAD_BF16) {
++            *err = "'" + t.name + "' is " + t.storage + "; a map is f32 or bf16";
++            return RAD_E_DTYPE;
++        }
++        if (t.shape.size() != 2 || t.shape[0] < 1 || t.shape[1] < 1) {
++            *err = "'" + t.name + "' is not a [key_dim, index_dim] matrix";
++            return RAD_E_SHAPE;
++        }
++        if (out->key_dim == 0) {
++            out->key_dim = t.shape[0];
++            out->index_dim = t.shape[1];
++        } else if (t.shape[0] != out->key_dim || t.shape[1] != out->index_dim) {
++            *err = "'" + t.name + "' is [" + std::to_string(t.shape[0]) + ", " +
++                   std::to_string(t.shape[1]) + "] and the first map [" +
++                   std::to_string(out->key_dim) + ", " + std::to_string(out->index_dim) +
++                   "]: every map has one shape";
++            return RAD_E_SHAPE;
++        }
++        auto& slot = by_layer[layer];
++        if (slot[side]) {
++            *err = "'" + t.name + "' appears twice";
++            return RAD_E_INVAL;
++        }
++        slot[side] = &t;
++    }
++    if (by_layer.empty()) {
++        *err = "the file holds no map";
++        return RAD_E_INVAL;
++    }
++    const int64_t per = out->key_dim * out->index_dim;
++    out->n_layers = n_model_layers;
++    out->map_of_layer.assign((size_t) n_model_layers, -1);
++    out->maps.resize((size_t) (by_layer.size() * 2 * per));
++    for (const auto& [layer, pair] : by_layer) {
++        for (int side = 0; side < 2; ++side)
++            if (!pair[side]) {
++                *err = "layer " + std::to_string(layer) + " has " +
++                       (side ? "no W_K_idx" : "no W_Q_idx") + "; a layer needs both maps";
++                return RAD_E_INVAL;
++            }
++        const int64_t m = out->n_maps();
++        out->map_of_layer[(size_t) layer] = (int32_t) m;
++        out->layers.push_back((int32_t) layer);
++        for (int side = 0; side < 2; ++side) {
++            const TorchTensor& t = *pair[side];
++            uint16_t* dst = &out->maps[(size_t) ((m * 2 + side) * per)];
++            if (t.dtype == RAD_BF16) {
++                std::memcpy(dst, t.data, (size_t) per * 2);
++            } else {
++                for (int64_t i = 0; i < per; ++i) {
++                    float v;
++                    std::memcpy(&v, t.data + i * 4, 4);
++                    dst[i] = bf16_of(v);
++                }
++            }
++        }
++    }
++    out->window = cfg.lsa_window;
++    out->sink = cfg.lsa_sink;
++    out->top_k = cfg.lsa_top_k;
++    out->top_p = cfg.lsa_top_p;
++    out->pool = cfg.lsa_pool;
++    out->bucket = cfg.lsa_bucket;
++    out->bucket_cap = cfg.lsa_bucket_cap;
++    out->path = path;
++    return RAD_OK;
++}
++
++const void* lsa_map_upload(const LsaMap& m, int rank) {
++    if (!m.loaded()) return nullptr;
++    void* d = rad_dev_alloc(m.bytes(), RAD_MEM_DEVICE);
++    if (!d) {
++        RAD_ERR("--lsa: rank %d: could not allocate %.2f MiB on the card for the index maps", rank,
++                (double) m.bytes() / (1024.0 * 1024.0));
++        return nullptr;
++    }
++    RadStream s = nullptr;
++    if (rad_stream_create(&s, 0) < 0) {
++        rad_dev_free(d, RAD_MEM_DEVICE);
++        return nullptr;
++    }
++    const int rc = rad_memcpy_async(d, m.maps.data(), m.bytes(), s);
++    rad_stream_sync(s);
++    rad_stream_destroy(s);
++    if (rc < 0) {
++        RAD_ERR("--lsa: rank %d: uploading the index maps failed: %s", rank, rad_dev_last_error());
++        rad_dev_free(d, RAD_MEM_DEVICE);
++        return nullptr;
++    }
++    return d;
++}
++
++RadLsaMap lsa_map_view(const LsaMap& m, const void* maps_device) {
++    RadLsaMap v{};
++    v.maps = maps_device;
++    v.map_of_layer = m.map_of_layer.data();
++    v.n_layers = m.n_layers;
++    v.n_maps = m.n_maps();
++    v.key_dim = m.key_dim;
++    v.index_dim = m.index_dim;
++    v.window = m.window;
++    v.sink = m.sink;
++    v.top_k = m.top_k;
++    v.top_p = m.top_p;
++    v.pool = m.pool;
++    v.bucket = m.bucket;
++    v.bucket_cap = m.bucket_cap;
++    return v;
++}
++
++}  /* namespace rad */
+diff --git a/core/lsa.h b/core/lsa.h
+new file mode 100644
+index 0000000..83dcf60
+--- /dev/null
++++ b/core/lsa.h
+@@ -0,0 +1,59 @@
++/* lsa.h -- D-LSA's index maps: the --lsa sidecar read, checked and handed to each rank.
++ *
++ * D-LSA (latent sparse attention, Prefrontal-AI, arXiv 2610.42147, Apache-2.0) gives each key of a
++ * full-attention layer a 64-dim index key, its position-free dims through a learned map, and has a
++ * decode query read the keys of the buckets its index query scores best (abi/rad_builder.h
++ * RadLsaMap; libref/ref_lsa.h for the algorithm). The maps ship as the paper's `d-lsa-weights-v1`
++ * files: a torch zip (torch.save of a state dict) of `{L}.W_Q_idx` and `{L}.W_K_idx` for each
++ * full-attention layer L, [key_dim, index_dim] f32 -- on Qwen3.8-27B sixteen layers of [768, 64],
++ * 768 being its four KV heads' 192 dims past the rotated 64.
++ *
++ * The file is read without running its pickle (format/torch_zip.h). It is refused unless every
++ * entry is one of those two names for a layer inside the model, every layer has both, and every
++ * map has one shape. Whether the shape fits the model's heads is the plugin's question, which it
++ * answers at declare. The sizes (--lsa-window and the rest) must nest as the design requires:
++ * pool divides bucket and cap, bucket divides window, cap is at least twice bucket, and top_p
++ * buckets of cap keys can fill top_k.
++ *
++ * The maps are kept in bf16, the form the plugin's projection reads (the SGLang plugin rounds them
++ * so too), one [2][key_dim][index_dim] block a map, W_Q first, and each rank gets its own device
++ * copy outside the program's arena, as a control vector's is. */
++#pragma once
++#include "rad_internal.h"
++
++#include <string>
++#include <vector>
++
++namespace rad {
++
++struct Config;
++
++struct LsaMap {
++    std::vector<uint16_t> maps;           /* [n_maps][2][key_dim][index_dim] bf16 */
++    std::vector<int32_t>  map_of_layer;   /* [n_layers]: the map of model layer l, or -1 */
++    std::vector<int32_t>  layers;         /* the mapped layers, ascending */
++    int64_t n_layers = 0, key_dim = 0, index_dim = 0;
++    int64_t window = 0, sink = 0, top_k = 0, top_p = 0, pool = 0, bucket = 0, bucket_cap = 0;
++    std::string path;
++
++    bool    loaded() const { return !maps.empty(); }
++    int64_t n_maps() const { return (int64_t) layers.size(); }
++    int64_t bytes() const { return (int64_t) maps.size() * 2; }
++};
++
++/* Null when the sizes nest as the design requires, else why not. */
++const char* lsa_sizes_refusal(int64_t window, int64_t sink, int64_t top_k, int64_t top_p,
++                              int64_t pool, int64_t bucket, int64_t bucket_cap);
++
++/* Read and check `path` against a model of `n_model_layers`, with the sizes `cfg` gives. */
++int lsa_map_load(const std::string& path, int64_t n_model_layers, const Config& cfg, LsaMap* out,
++                 std::string* err);
++
++/* Upload the maps to a fresh device buffer on the current device, or null on failure. The caller
++ * frees it with rad_dev_free(RAD_MEM_DEVICE). */
++const void* lsa_map_upload(const LsaMap& m, int rank);
++
++/* The ABI view for one rank over its device copy. */
++RadLsaMap lsa_map_view(const LsaMap& m, const void* maps_device);
++
++}  /* namespace rad */
+diff --git a/core/rad_core.h b/core/rad_core.h
+index b92a1d5..9c5c65d 100644
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -911,6 +911,19 @@ struct Config {
+      * default on. The graph is declared once, so this flag is the deployment's only decision about
+      * whether the op exists at all; the value names the startup switch. */
+     std::string control_vector = "disabled";
++    /* --lsa MAP: D-LSA, latent sparse attention (core/lsa.h). Empty, the default, declares nothing
++     * of it. With a map, each full-attention layer of a plugin that serves it stores an index key
++     * a token, clusters each `lsa_window`-key block once it closes, and has its decode queries
++     * read their sinks, their window and the `lsa_top_k` keys of their `lsa_top_p` best buckets.
++     * The sizes are the paper's flat design's (src/lsa/sglang/settings/design.py). */
++    std::string lsa_map;
++    int64_t lsa_window = 512;
++    int64_t lsa_sink = 4;
++    int64_t lsa_top_k = 4096;
++    int64_t lsa_top_p = 1024;
++    int64_t lsa_pool = 4;
++    int64_t lsa_bucket = 8;
++    int64_t lsa_bucket_cap = 16;
+     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
+     /* Checkpoint intervals one step may carry of a prefill alone in its step, from an interval
+      * boundary past the first (--prefill-span; 1 splits at every interval). The step's rows stay
+diff --git a/tests/abi_layout_test.cpp b/tests/abi_layout_test.cpp
+index a794307..16f0fc0 100644
+--- a/tests/abi_layout_test.cpp
++++ b/tests/abi_layout_test.cpp
+@@ -8,7 +8,7 @@
+  *
+  * Checked: a C translation unit (abi_c_test.c, strict C11) lays every struct out as C++ does; every
+  * struct's listed fields account for its size, so the list in rad_abi_layout_rows.h is complete; and
+- * the layout agrees with the table below, taken at RAD_ABI_VERSION 32 and RAD_FORMAT_VER 2. Under
++ * the layout agrees with the table below, taken at RAD_ABI_VERSION 33 and RAD_FORMAT_VER 2. Under
+  * those versions a listed field may not move or change size, an ABI struct may only grow by fields
+  * past its old end, and an on-disk struct may not change at all. The table is a snapshot of the
+  * headers: nothing else states the layout. When it disagrees the test prints the live table.
+@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
+     };
+ }
+ 
+-/* The layout at RAD_ABI_VERSION 32 / RAD_FORMAT_VER 2 (see the file header). */
+-constexpr uint32_t kTableAbi = 32, kTableFormat = 2;
++/* The layout at RAD_ABI_VERSION 33 / RAD_FORMAT_VER 2 (see the file header). */
++constexpr uint33_t kTableAbi = 33, kTableFormat = 2;
+ const AbiRow kTable[] = {
+ #include "abi_layout_table.h"
+ };
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index a28486a..4da322f 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -278,6 +278,103 @@ TEST(declare_is_a_qwen35_trunk) {
+     CHECK_EQ(count_op(b, "silu_mul"), 8);
+ }
+ 
++/* --lsa (RadBuildCtx::lsa, arch/common/rad_block_lsa.h): each full-attention layer declares D-LSA's
++ * index side -- two groups for the model, three ops a layer -- and attends its decode rows over
++ * their lists where a library declares `attn_paged_list`; a prefill stores and clusters but attends
++ * densely. A map of another model's shape and a deployment of two ranks are refused. Without the
++ * flag the graph is the one pinned in with_every_op_declared_each_architecture_declares_its_
++ * unchanged_graph. */
++TEST(qwen35_bf16_lsa_declares_the_index_side) {
++    RadModelMeta meta = qwen35_meta();
++    std::vector<uint16_t> maps(2 * 2 * 768 * 64);
++    std::vector<int32_t> mol(8, -1);
++    mol[3] = 0;
++    mol[7] = 1;
++    RadLsaMap lm{};
++    lm.maps = maps.data(); lm.map_of_layer = mol.data(); lm.n_layers = 8; lm.n_maps = 2;
++    lm.key_dim = 768; lm.index_dim = 64; lm.window = 512; lm.sink = 4; lm.top_k = 4096;
++    lm.top_p = 1024; lm.pool = 4; lm.bucket = 8; lm.bucket_cap = 16;
++    RadBuildCtx ctx = build_ctx();
++    ctx.lsa = &lm;
++
++    RadBuilder b;
++    CHECK_OK(qwen35_bf16::declare(&b, &meta, &ctx));
++    for (const char* op : { "lsa_index_store", "lsa_cluster", "lsa_select", "attn_paged_list" })
++        CHECK_EQ(count_op(b, op), 2);
++    CHECK_EQ(count_op(b, "attn_paged"), 2);   /* the prefill half's */
++    const RecKV* idx = nullptr;
++    const RecKV* bkt = nullptr;
++    for (const auto& k : b.kv_groups) {
++        if (k.name == "kv_lsa_idx") idx = &k;
++        if (k.name == "kv_lsa_bkt") bkt = &k;
++    }
++    REQUIRE(idx && bkt);
++    /* A token's index key is one bf16 row of 64 over the manager's K and V halves; a block's
++     * buckets are 64 of (64 + 16) * 2 bytes over its 512 tokens' halves. */
++    CHECK_EQ(idx->d.dtype, (uint32_t)RAD_BF16);
++    CHECK_EQ(idx->d.head_dim * 2, (int64_t)64);
++    CHECK_EQ(bkt->d.dtype, (uint32_t)RAD_U8);
++    CHECK_EQ(2 * 512 * bkt->d.head_dim, (int64_t)(64 * (64 + 16) * 2));
++    CHECK(idx->dense && bkt->dense);
++    int bound = 0;
++    for (const auto& [l, g] : b.binds)
++        if (g == (rad_kvgroup)(idx - b.kv_groups.data() + 1) || g == (rad_kvgroup)(bkt - b.kv_groups.data() + 1)) {
++            CHECK(l == 3 || l == 7);
++            ++bound;
++        }
++    CHECK_EQ(bound, 4);
++    for (const auto& o : b.ops)
++        if (o.op == "lsa_cluster") CHECK_EQ(pint(&o, "block_size"), 512);
++
++    /* A decode step attends over the lists; a prefill step keeps the dense attention. */
++    RadBatch batch = decode_batch();
++    RadCtx c{ .b = &b, .batch = &batch };
++    qwen35_bf16::step(&c, &batch);
++    CHECK_LINT(b, &c);
++    std::vector<std::string> ops = issued_ops(b, c);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "lsa_select"), 2);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "attn_paged_list"), 2);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "attn_paged"), 0);
++    {
++        const auto at = [&](const char* op) { return std::find(ops.begin(), ops.end(), op) - ops.begin(); };
++        CHECK(at("kv_store") < at("lsa_index_store"));
++        CHECK(at("lsa_index_store") < at("lsa_cluster"));
++        CHECK(at("lsa_cluster") < at("lsa_select"));
++        CHECK(at("lsa_select") < at("attn_paged_list"));
++    }
++    RadBatch pre = prefill_batch();
++    RadCtx cp{ .b = &b, .batch = &pre };
++    qwen35_bf16::step(&cp, &pre);
++    CHECK_LINT(b, &cp);
++    ops = issued_ops(b, cp);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "lsa_index_store"), 2);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "lsa_cluster"), 2);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "lsa_select"), 0);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "attn_paged"), 2);
++
++    /* With no library declaring the list attention the index side is kept, the attention dense. */
++    RadBuilder nb;
++    nb.undeclared.insert("attn_paged_list");
++    CHECK_OK(qwen35_bf16::declare(&nb, &meta, &ctx));
++    CHECK_EQ(count_op(nb, "attn_paged_list"), 0);
++    CHECK_EQ(count_op(nb, "lsa_cluster"), 2);
++    RadBatch dec = decode_batch();
++    RadCtx cn{ .b = &nb, .batch = &dec };
++    qwen35_bf16::step(&cn, &dec);
++    ops = issued_ops(nb, cn);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "lsa_select"), 0);
++    CHECK_EQ(std::count(ops.begin(), ops.end(), "attn_paged"), 2);
++
++    lm.key_dim = 512;
++    RadBuilder bad;
++    CHECK_EQ(stderr_of_rc([&] { return qwen35_bf16::declare(&bad, &meta, &ctx); }), RAD_E_SHAPE);
++    lm.key_dim = 768;
++    RadBuildCtx two = build_ctx(0, 2);
++    two.lsa = &lm;
++    RadBuilder tp;
++    CHECK_EQ(stderr_of_rc([&] { return qwen35_bf16::declare(&tp, &meta, &two); }), RAD_E_UNSUPPORTED);
++}
++
+ TEST(qwen35_bf16_yarn_reaches_every_text_rotary_op) {
+     RadModelMeta meta = qwen35_meta();
+     std::vector<const char*> keys(meta.kv_key, meta.kv_key + meta.n_kv);
+diff --git a/tests/config_test.cpp b/tests/config_test.cpp
+index 4875f01..89ba68e 100644
+--- a/tests/config_test.cpp
++++ b/tests/config_test.cpp
+@@ -529,6 +529,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
+         { "--trusted-proxy", { "127.0.0.0/8" } },
+         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
+         { "--control-vector", { "off" } },
++        { "--lsa", { "/m/lsa.pt" } }, { "--lsa-window", { "256" } }, { "--lsa-sink", { "0" } },
++        { "--lsa-top-k", { "2048" } }, { "--lsa-top-p", { "512" } }, { "--lsa-pool", { "2" } },
++        { "--lsa-bucket", { "4" } }, { "--lsa-bucket-cap", { "8" } },
+         { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },
+         { "--temp", { "0.7" } }, { "--top-k", { "40" } }, { "--top-p", { "0.9" } },
+         { "--min-p", { "0.05" } }, { "--reasoning-effort", { "low" } },
+-- 
+2.53.0
+
